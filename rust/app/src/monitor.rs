@@ -25,6 +25,7 @@ struct Checkpoint {
     directories: Vec<String>,
     renderer_profile: String,
     known_files: Vec<String>,
+    max_file_mb: Option<u64>,
 }
 enum Event {
     File(PathBuf, bool),
@@ -35,6 +36,7 @@ enum Event {
     Journal(String),
     Overflow(String),
     Wake,
+    Track(PathBuf),
     Shutdown(mpsc::SyncSender<()>),
 }
 fn signature(cfg: &Config, extensions: bool) -> String {
@@ -123,7 +125,7 @@ fn scan(root: PathBuf, cfg: &Config, tx: &mpsc::SyncSender<Event>, broker: &Brok
     }
     let _ = tx.send(Event::Scanned(root));
 }
-fn watch(root: PathBuf, tx: mpsc::SyncSender<Event>, cfg: Config) {
+fn watch(root: PathBuf, tx: mpsc::SyncSender<Event>, cfg: Config, recursive: bool) {
     thread::spawn(move || {
         background();
         unsafe {
@@ -146,7 +148,7 @@ fn watch(root: PathBuf, tx: mpsc::SyncSender<Event>, cfg: Config) {
                     handle,
                     bytes.as_mut_ptr() as _,
                     bytes.len() as u32,
-                    1,
+                    i32::from(recursive),
                     0x01 | 0x02 | 0x08 | 0x10,
                     &mut returned,
                     null_mut(),
@@ -157,6 +159,9 @@ fn watch(root: PathBuf, tx: mpsc::SyncSender<Event>, cfg: Config) {
                 if ok == 0 || returned == 0 {
                     let _ = tx.send(Event::Overflow(volume));
                     if ok == 0 && error != ERROR_NOTIFY_ENUM_DIR {
+                        if let Err(e) = crate::cache_index::remove_deleted(&root) {
+                            crate::cache_index::log(&e);
+                        }
                         use std::io::Write;
                         if let Ok(mut f) = fs::OpenOptions::new()
                             .create(true)
@@ -192,13 +197,18 @@ fn watch(root: PathBuf, tx: mpsc::SyncSender<Event>, cfg: Config) {
                         .map(|x| u16::from_le_bytes([x[0], x[1]]))
                         .collect::<Vec<_>>();
                     let path = root.join(String::from_utf16_lossy(&words));
-                    if cfg.included(&path) {
-                        if action == 2 || action == 4 {
-                            if cfg.supports(&path) {
-                                let _ = tx.send(Event::Deleted(path));
-                                relevant = true;
-                            }
-                        } else if action == 1 || action == 5 {
+                    if action == 2 || action == 4 {
+                        if path.extension().is_some_and(|e| {
+                            common::hooks::EXTENSIONS
+                                .iter()
+                                .any(|x| x[1..].eq_ignore_ascii_case(&e.to_string_lossy()))
+                        }) || crate::cache_index::tracks_directory(&path)
+                        {
+                            let _ = tx.send(Event::Deleted(path));
+                            relevant = true;
+                        }
+                    } else if cfg.included(&path) {
+                        if action == 1 || action == 5 {
                             if path.is_dir() {
                                 let _ = tx.send(Event::Directory(path));
                                 relevant = true;
@@ -247,6 +257,7 @@ fn save(
         directories: dirs.iter().map(|p| p.to_string_lossy().into()).collect(),
         renderer_profile: cfg.profile(),
         known_files: known.iter().map(|p| p.to_string_lossy().into()).collect(),
+        max_file_mb: Some(cfg.max_file_mb),
     };
     common::cache::atomic_write(
         &common::data_dir().join("checkpoint-v2.json"),
@@ -265,6 +276,11 @@ pub fn shutdown() {
 pub fn wake() {
     if let Some(tx) = NOTIFY.get() {
         let _ = tx.send(Event::Wake);
+    }
+}
+pub fn track_source(path: PathBuf) {
+    if let Some(tx) = NOTIFY.get() {
+        let _ = tx.try_send(Event::Track(path));
     }
 }
 pub fn start(broker: Arc<Broker>) {
@@ -288,10 +304,49 @@ pub fn start(broker: Arc<Broker>) {
         }
     });
 }
+fn cleanup_only(cfg: &Config) -> anyhow::Result<()> {
+    let (tx, rx) = mpsc::sync_channel(4096);
+    let _ = NOTIFY.set(tx.clone());
+    let roots = cfg.roots_available();
+    for root in &roots {
+        watch(root.clone(), tx.clone(), cfg.clone(), true);
+    }
+    let mut watched = HashSet::new();
+    let mut track = |source: PathBuf| {
+        if roots.iter().any(|root| common::below(&source, root)) {
+            return;
+        }
+        if let Some(parent) = source.parent() {
+            if watched.insert(parent.to_owned()) {
+                watch(parent.to_owned(), tx.clone(), cfg.clone(), false);
+            }
+        }
+    };
+    for path in crate::cache_index::sources().unwrap_or_default() {
+        track(path);
+    }
+    while let Ok(event) = rx.recv() {
+        match event {
+            Event::Deleted(path) => {
+                if let Err(e) = crate::cache_index::remove_deleted(&path) {
+                    crate::cache_index::log(&e);
+                }
+            }
+            Event::Track(path) => track(path),
+            Event::Shutdown(ack) => {
+                let _ = ack.send(());
+                break;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
 fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
     let cfg = Config::load()?;
+    crate::cache_index::reconcile();
     if cfg.extensions.is_empty() {
-        return Ok(());
+        return cleanup_only(&cfg);
     }
     let sig = signature(&cfg, true);
     let legacy = signature(&cfg, false);
@@ -320,7 +375,7 @@ fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
         if s.renderer_profile.is_empty() && s.known_files.is_empty() {
             known.extend(legacy_inventory(&cfg));
         }
-        if s.renderer_profile != cfg.profile() {
+        if s.renderer_profile != cfg.profile() || s.max_file_mb.unwrap_or(0) != cfg.max_file_mb {
             for p in &known {
                 files.insert(p.clone(), (Instant::now(), 0));
             }
@@ -338,12 +393,27 @@ fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
             }
         }
     }
+    // Attach links to already cached images using metadata, without importing
+    // a model or requesting a scan. The DLL's cache-hit path stays unchanged.
+    for source in known.iter().cloned().chain(
+        saved
+            .iter()
+            .flat_map(|s| s.known_files.iter().map(PathBuf::from))
+            .filter(|p| !known.contains(p)),
+    ) {
+        if let Some(image) = common::cache::find(&source, &cfg) {
+            if let Err(e) = crate::cache_index::remember(&source, &image, &cfg) {
+                crate::cache_index::log(&e);
+            }
+        }
+    }
     let (tx, rx) = mpsc::sync_channel(4096);
     let _ = NOTIFY.set(tx.clone());
-    let (render_tx, render_rx) = mpsc::sync_channel::<PathBuf>(2);
+    let pipeline = cfg.worker_count().saturating_add(1).max(2);
+    let (render_tx, render_rx) = mpsc::sync_channel::<PathBuf>(pipeline);
     let render_rx = Arc::new(std::sync::Mutex::new(render_rx));
     let (scan_tx, scan_rx) = mpsc::sync_channel::<PathBuf>(1);
-    for _ in 0..2 {
+    for _ in 0..pipeline {
         let b = broker.clone();
         let t = tx.clone();
         let rx = render_rx.clone();
@@ -354,7 +424,11 @@ fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
                     Ok(p) => p,
                     Err(_) => break,
                 };
-                let ok = b.thumbnail_priority(p.clone(), true).is_ok();
+                let result = b.thumbnail_priority(p.clone(), true);
+                let ok = result.is_ok()
+                    || result.as_ref().err().is_some_and(|e| {
+                        e.starts_with("Skipped:") || e.starts_with("Look import failed:")
+                    });
                 let _ = t.send(Event::Finished(p, ok));
             }
         });
@@ -370,8 +444,19 @@ fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
             }
         });
     }
-    for root in cfg.roots_available() {
-        watch(root, tx.clone(), cfg.clone());
+    let watched = cfg.roots_available();
+    for root in &watched {
+        watch(root.clone(), tx.clone(), cfg.clone(), true);
+    }
+    let mut auxiliary = HashSet::new();
+    for source in crate::cache_index::sources().unwrap_or_default() {
+        if !watched.iter().any(|r| common::below(&source, r)) {
+            if let Some(parent) = source.parent() {
+                if auxiliary.insert(parent.to_owned()) {
+                    watch(parent.to_owned(), tx.clone(), cfg.clone(), false);
+                }
+            }
+        }
     }
     let volumes = cfg
         .roots_available()
@@ -535,7 +620,7 @@ fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
                 active_dir = Some(p);
             }
         }
-        while active_files.len() < 2 && !*broker.state.paused.lock().unwrap() {
+        while active_files.len() < pipeline && !*broker.state.paused.lock().unwrap() {
             if let Some(p) = files
                 .iter()
                 .find(|(p, v)| v.0 <= now && !active_files.contains(*p))
@@ -555,7 +640,7 @@ fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
         for t in journals_due.values() {
             consider(*t)
         }
-        if active_files.len() < 2 && !*broker.state.paused.lock().unwrap() {
+        if active_files.len() < pipeline && !*broker.state.paused.lock().unwrap() {
             for (p, (v, _)) in &files {
                 if !active_files.contains(p) {
                     consider(*v)
@@ -596,6 +681,9 @@ fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
                     }
                 }
                 Event::Deleted(p) => {
+                    if let Err(e) = crate::cache_index::remove_deleted(&p) {
+                        crate::cache_index::log(&e);
+                    }
                     if cfg.included(&p) {
                         if !known.remove(&p) {
                             known.retain(|v| !common::below(v, &p));
@@ -660,6 +748,15 @@ fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
                     }
                 }
                 Event::Wake => {}
+                Event::Track(source) => {
+                    if !watched.iter().any(|r| common::below(&source, r)) {
+                        if let Some(parent) = source.parent() {
+                            if auxiliary.insert(parent.to_owned()) {
+                                watch(parent.to_owned(), tx.clone(), cfg.clone(), false);
+                            }
+                        }
+                    }
+                }
                 Event::Shutdown(ack) => {
                     let _ = save(&cfg, &cursors, &files, &dirs, &known);
                     let _ = ack.send(());

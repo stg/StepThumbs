@@ -1,6 +1,8 @@
 #![allow(non_snake_case)]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod cache_index;
 mod hooks_test;
+mod import_worker;
 mod journal;
 mod monitor;
 mod ui;
@@ -8,12 +10,11 @@ use anyhow::{Context, Result, bail};
 use look::{
     camera::prepare_camera,
     config::{
-        CameraKind, LightingConfig, LightingPreset, MaterialMode, NamedView, RenderConfig, UpAxis,
+        CameraKind, LightingConfig, LightingPreset, MaterialMode, NamedView, RenderConfig,
         ViewConfig,
     },
     renderer::{Renderer, WgpuRenderer},
-    scene::{CompiledScene, compile_scene_for_render_with_control},
-    timing::Timings,
+    scene::CompiledScene,
 };
 use std::{
     collections::HashMap,
@@ -28,6 +29,20 @@ use stepthumbnail_common::{
     ipc::{Request, Response},
 };
 type Outcome = Result<PathBuf, String>;
+fn check_model_size(path: &Path, config: &Config) -> Result<(), String> {
+    let metadata = fs::metadata(path).map_err(|e| e.to_string())?;
+    if !metadata.is_file() {
+        return Err("Not a model file".into());
+    }
+    if config.max_file_mb > 0 && metadata.len() > config.max_file_mb.saturating_mul(1024 * 1024) {
+        return Err(format!(
+            "Skipped: {} (over {} MiB limit)",
+            path.display(),
+            config.max_file_mb
+        ));
+    }
+    Ok(())
+}
 struct Job {
     path: PathBuf,
     key: String,
@@ -55,7 +70,44 @@ struct State {
     journal_passes: std::sync::atomic::AtomicU64,
     current: Mutex<std::collections::HashSet<PathBuf>>,
     scanning: Mutex<Option<PathBuf>>,
-    recent: Mutex<std::collections::VecDeque<String>>,
+    recent: Mutex<std::collections::VecDeque<Activity>>,
+}
+struct Activity {
+    key: String,
+    path: PathBuf,
+    text: String,
+    done: bool,
+}
+fn activity(state: &State, key: &str, path: &Path, text: String, done: bool) {
+    let text = common::brief_error(&text);
+    let mut recent = state.recent.lock().unwrap();
+    if done {
+        if let Some(entry) = recent.iter_mut().find(|entry| entry.key == key) {
+            entry.text = text;
+            entry.done = true;
+        } else if !recent.iter().any(|entry| entry.path == path) {
+            recent.push_front(Activity {
+                key: key.into(),
+                path: path.into(),
+                text,
+                done,
+            });
+        }
+    } else {
+        recent.retain(|entry| entry.path != path);
+        recent.push_front(Activity {
+            key: key.into(),
+            path: path.into(),
+            text,
+            done,
+        });
+    }
+    while recent.len() > 32 {
+        let Some(index) = recent.iter().rposition(|entry| entry.done) else {
+            break;
+        };
+        recent.remove(index);
+    }
 }
 enum GpuJob {
     Ready(Arc<Job>, CompiledScene, look::import_control::ImportControl),
@@ -64,28 +116,33 @@ enum GpuJob {
 }
 struct Broker {
     state: Arc<State>,
-    cpu: mpsc::Sender<Arc<Job>>,
-    background: mpsc::Sender<Arc<Job>>,
+    cpu: crossbeam_channel::Sender<Arc<Job>>,
+    background: crossbeam_channel::Sender<Arc<Job>>,
     shared_stats: Option<common::shared_stats::SharedStats>,
+    cache_limit_mb: u64,
 }
 fn finish(state: &State, job: &Arc<Job>, result: Outcome) {
     use std::sync::atomic::Ordering;
     if result.is_ok() {
         state.success.fetch_add(1, Ordering::Relaxed);
-    } else {
+    } else if !result
+        .as_ref()
+        .err()
+        .is_some_and(|e| e.starts_with("Skipped:"))
+    {
         state.failures.fetch_add(1, Ordering::Relaxed);
     }
-    {
-        let mut recent = state.recent.lock().unwrap();
-        let text = match &result {
-            Ok(_) => format!("Rendered: {}", job.path.display()),
-            Err(e) => format!("Failed: {} ({})", job.path.display(), e),
-        };
-        recent.push_front(text);
-        while recent.len() > 6 {
-            recent.pop_back();
-        }
-    }
+    activity(
+        state,
+        &job.key,
+        &job.path,
+        match &result {
+            Ok(_) => format!("Ready: {}", job.path.display()),
+            Err(error) if error.starts_with("Skipped:") => error.clone(),
+            Err(error) => format!("Failed: {} ({error})", job.path.display()),
+        },
+        true,
+    );
     if let Err(ref error) = result {
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -166,7 +223,10 @@ fn render(gpu: &mut WgpuRenderer, job: &Job, scene: &CompiledScene) -> Result<Pa
         let _ = fs::remove_file(&path);
         bail!("Source changed during rendering")
     }
-    common::cache::record_and_prune(c.max_cache_mb, bytes.get_ref().len() as u64);
+    cache_index::remember(&job.path, &path, c).unwrap_or_else(|e| {
+        cache_index::log(&e);
+    });
+    cache_index::prune(c.max_cache_mb);
     Ok(path)
 }
 // Windows does not expose child-process I/O priority through the public
@@ -215,7 +275,7 @@ fn child_priority(handle: usize, low: bool) {
                 .append(true)
                 .open(common::data_dir().join("activity.log"))
             {
-                let _ = writeln!(f, "Could not adjust F3D I/O priority: {status:?}");
+                let _ = writeln!(f, "Could not adjust worker I/O priority: {status:?}");
             }
         }
     }
@@ -329,7 +389,10 @@ fn render_f3d(job: &Job) -> Result<PathBuf> {
             let _ = fs::remove_file(&dst);
             bail!("Source changed during rendering")
         }
-        common::cache::record_and_prune(job.config.max_cache_mb, bytes.len() as u64);
+        cache_index::remember(&job.path, &dst, &job.config).unwrap_or_else(|e| {
+            cache_index::log(&e);
+        });
+        cache_index::prune(job.config.max_cache_mb);
         Ok(dst)
     })();
     let _ = fs::remove_file(temp);
@@ -358,39 +421,27 @@ fn import_background(enabled: bool) -> bool {
 }
 
 fn release_last(state: &State, renderer: &mut Option<WgpuRenderer>, job: &Job) {
-    let jobs = state.jobs.lock().unwrap();
-    if jobs.len() == 1 && jobs.contains_key(&job.key) {
+    let last = {
+        let jobs = state.jobs.lock().unwrap();
+        jobs.len() == 1 && jobs.contains_key(&job.key)
+    };
+    if last {
         drop(renderer.take());
         state
             .gpu_active
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
-fn fallback(state: Arc<State>, tx: mpsc::Sender<GpuJob>, job: Arc<Job>, original: String) {
-    thread::spawn(move || {
-        let low = job.background.load(std::sync::atomic::Ordering::Acquire);
-        if low {
-            import_background(true);
-        }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render_f3d(&job)))
-            .map_err(|_| "F3D fallback panicked".to_string())
-            .and_then(|r| r.map_err(|e| format!("{original}; F3D fallback: {e:#}")));
-        if low {
-            import_background(false);
-        }
-        if tx
-            .send(GpuJob::Finished(job.clone(), result.clone()))
-            .is_err()
-        {
-            finish(&state, &job, result);
-        }
-    });
-}
 fn process_metrics() -> (u64, f64) {
+    let (memory, cpu) =
+        process_metrics_for(unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() });
+    let (workers_memory, workers_cpu) = import_worker::metrics();
+    (memory + workers_memory, cpu + workers_cpu)
+}
+fn process_metrics_for(h: windows_sys::Win32::Foundation::HANDLE) -> (u64, f64) {
     unsafe {
         use windows_sys::Win32::Foundation::FILETIME;
         use windows_sys::Win32::System::{ProcessStatus::*, Threading::*};
-        let h = GetCurrentProcess();
         let mut m: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
         let n = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
         m.cb = n;
@@ -407,6 +458,8 @@ fn process_metrics() -> (u64, f64) {
 }
 impl Broker {
     fn new() -> Arc<Self> {
+        let config = Config::load().unwrap_or_default();
+        let workers = config.worker_count();
         let state = Arc::new(State {
             jobs: Mutex::new(HashMap::new()),
             gpu_active: false.into(),
@@ -426,39 +479,20 @@ impl Broker {
             scanning: Mutex::new(None),
             recent: Mutex::new(std::collections::VecDeque::new()),
         });
-        let (cpu_tx, cpu_rx) = mpsc::channel::<Arc<Job>>();
-        let cpu_rx = Arc::new(Mutex::new(cpu_rx));
-        let (bg_tx, bg_rx) = mpsc::channel::<Arc<Job>>();
-        let bg_rx = Arc::new(Mutex::new(bg_rx));
+        let (cpu_tx, cpu_rx) = crossbeam_channel::unbounded::<Arc<Job>>();
+
+        let (bg_tx, bg_rx) = crossbeam_channel::unbounded::<Arc<Job>>();
+
         let (gpu_tx, gpu_rx) = mpsc::channel::<GpuJob>();
-        let foreground_pool = Arc::new(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(2)
-                .thread_name(|i| format!("thumbnail-foreground-{i}"))
-                .build()
-                .expect("foreground pool"),
-        );
-        let background_pool = Arc::new(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(1)
-                .thread_name(|i| format!("thumbnail-background-{i}"))
-                .build()
-                .expect("background pool"),
-        );
-        for (low, rx) in [
-            (false, cpu_rx.clone()),
-            (false, cpu_rx.clone()),
-            (true, bg_rx),
-        ] {
+        let dispatchers = [(false, cpu_rx.clone()), (false, cpu_rx.clone())]
+            .into_iter()
+            .chain((0..workers).map(|_| (true, bg_rx.clone())));
+        for (low, rx) in dispatchers {
             let rx = rx.clone();
-            let pool = if low {
-                background_pool.clone()
-            } else {
-                foreground_pool.clone()
-            };
             let tx = gpu_tx.clone();
             let state = state.clone();
             thread::spawn(move || {
+                let mut importer: Option<import_worker::Importer> = None;
                 if low {
                     unsafe {
                         windows_sys::Win32::System::Threading::SetThreadPriority(
@@ -468,13 +502,23 @@ impl Broker {
                     }
                 }
                 loop {
-                    let job = match rx.lock().unwrap().recv() {
+                    let job = match if importer.is_some() {
+                        rx.recv_timeout(std::time::Duration::from_secs(10))
+                    } else {
+                        rx.recv()
+                            .map_err(|_| crossbeam_channel::RecvTimeoutError::Disconnected)
+                    } {
                         Ok(j) => j,
-                        Err(_) => break,
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                            importer = None;
+                            continue;
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                     };
                     if low {
                         let mut paused = state.paused.lock().unwrap();
                         while *paused {
+                            importer = None;
                             paused = state.resumed.wait(paused).unwrap();
                         }
                     }
@@ -482,7 +526,25 @@ impl Broker {
                         continue;
                     }
                     state.current.lock().unwrap().insert(job.path.clone());
+                    activity(
+                        &state,
+                        &job.key,
+                        &job.path,
+                        format!("Rendering: {}", job.path.display()),
+                        false,
+                    );
                     ui::update();
+                    // The file may have grown while waiting in the queue.
+                    if let Err(error) = check_model_size(&job.path, &job.config) {
+                        let result = Err(error);
+                        if tx
+                            .send(GpuJob::Finished(job.clone(), result.clone()))
+                            .is_err()
+                        {
+                            finish(&state, &job, result);
+                        }
+                        continue;
+                    }
                     if job.config.renderer == "f3d" {
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             render_f3d(&job)
@@ -504,59 +566,21 @@ impl Broker {
                         }
                         continue;
                     }
-                    let mut control = look::import_control::ImportControl::with_timeout(
+                    let control = look::import_control::ImportControl::with_timeout(
                         std::time::Duration::from_secs(120),
                     );
-                    if low {
-                        let promoted = job.clone();
-                        let metrics = state.clone();
-                        control = control.with_checkpoint_hook(move || {
-                            if !promoted
-                                .background
-                                .load(std::sync::atomic::Ordering::Acquire)
-                                && import_background(false)
-                            {
-                                metrics
-                                    .promotions
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        });
-                    }
-                    let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let mut times = Timings::default();
-                        pool.install(|| {
-                            if low {
-                                import_background(true);
-                            }
-                            let result = compile_scene_for_render_with_control(
-                                &job.path,
-                                UpAxis::Z,
-                                if job.config.source_colours {
-                                    MaterialMode::Source
-                                } else {
-                                    MaterialMode::Technical
-                                },
-                                &mut times,
-                                &control,
-                            );
-                            if low {
-                                import_background(false);
-                            }
-                            result
-                        })
-                    }));
-                    if let Err(e) = control.check() {
-                        let result = Err(format!("Import cancelled or timed out: {e:#}"));
-                        if tx
-                            .send(GpuJob::Finished(job.clone(), result.clone()))
-                            .is_err()
-                        {
-                            finish(&state, &job, result);
+                    let parsed = (|| -> Result<CompiledScene> {
+                        if importer.is_none() {
+                            importer =
+                                Some(import_worker::Importer::start(if low { 1 } else { 2 })?);
                         }
-                        continue;
+                        importer.as_mut().unwrap().import(&job, &state)
+                    })();
+                    if parsed.is_err() {
+                        importer = None;
                     }
                     match parsed {
-                        Ok(Ok(scene)) => {
+                        Ok(scene) => {
                             if let Ok(m) = std::fs::metadata(&job.path) {
                                 state
                                     .source_bytes
@@ -566,11 +590,29 @@ impl Broker {
                                 finish(&state, &job, Err("GPU worker stopped".into()))
                             }
                         }
-                        Ok(Err(e)) => {
-                            let _ = tx.send(GpuJob::Failed(job, format!("{e:#}")));
-                        }
-                        Err(_) => {
-                            let _ = tx.send(GpuJob::Failed(job, "Model import panicked".into()));
+                        Err(error) => {
+                            let error =
+                                if state.quiescing.load(std::sync::atomic::Ordering::Acquire) {
+                                    "Import cancelled for shutdown".to_owned()
+                                } else {
+                                    let details = common::brief_error(&error);
+                                    let permanent = details.contains(import_worker::TIMED_OUT)
+                                        || details.contains(": failed to parse STEP:");
+                                    let message = format!(
+                                        "Look import {}: {details}",
+                                        if permanent { "failed" } else { "unavailable" }
+                                    );
+                                    // A sharing violation or worker startup failure must
+                                    // remain retryable when the file becomes readable.
+                                    if permanent {
+                                        if let Err(e) = cache_index::mark_failed(&job.key, &message)
+                                        {
+                                            cache_index::log(&e);
+                                        }
+                                    }
+                                    message
+                                };
+                            let _ = tx.send(GpuJob::Failed(job, error));
                         }
                     }
                 }
@@ -578,11 +620,47 @@ impl Broker {
         }
         {
             let state = state.clone();
-            let signal = gpu_tx.clone();
+
             thread::spawn(move || {
                 use std::sync::atomic::Ordering;
                 let mut renderer: Option<WgpuRenderer> = None;
-                while let Ok(item) = gpu_rx.recv() {
+                let mut pending = std::collections::VecDeque::new();
+                loop {
+                    if pending.is_empty() {
+                        let next = if renderer.is_some() {
+                            gpu_rx.recv_timeout(std::time::Duration::from_secs(2))
+                        } else {
+                            gpu_rx
+                                .recv()
+                                .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+                        };
+                        let item = match next {
+                            Ok(item) => item,
+                            Err(mpsc::RecvTimeoutError::Timeout) => {
+                                drop(renderer.take());
+                                state.gpu_active.store(false, Ordering::SeqCst);
+                                ui::update();
+                                continue;
+                            }
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        };
+                        pending.push_back(item);
+                    }
+                    pending.extend(gpu_rx.try_iter());
+                    // A larger preflight pool must not put Explorer behind
+                    // every model that has already finished importing.
+                    let next = pending
+                        .iter()
+                        .position(|item| {
+                            let job = match item {
+                                GpuJob::Ready(job, ..)
+                                | GpuJob::Failed(job, ..)
+                                | GpuJob::Finished(job, ..) => job,
+                            };
+                            !job.background.load(Ordering::Acquire)
+                        })
+                        .unwrap_or(0);
+                    let item = pending.remove(next).unwrap();
                     match item {
                         GpuJob::Ready(job, scene, control) => {
                             if let Err(e) = control.check() {
@@ -622,22 +700,27 @@ impl Broker {
                                     release_last(&state, &mut renderer, &job);
                                     finish(&state, &job, Ok(path));
                                 }
-                                Err(e) => fallback(state.clone(), signal.clone(), job, e),
+                                Err(e) => {
+                                    release_last(&state, &mut renderer, &job);
+                                    finish(&state, &job, Err(e));
+                                }
                             }
                         }
-                        GpuJob::Failed(job, e) => fallback(state.clone(), signal.clone(), job, e),
+                        GpuJob::Failed(job, e) => {
+                            release_last(&state, &mut renderer, &job);
+                            finish(&state, &job, Err(e));
+                        }
                         GpuJob::Finished(job, result) => {
                             release_last(&state, &mut renderer, &job);
                             finish(&state, &job, result)
                         }
                     }
-                    let jobs = state.jobs.lock().unwrap();
-                    if jobs.is_empty() {
+                    let empty = state.jobs.lock().unwrap().is_empty();
+                    if empty {
                         drop(renderer.take());
                         state.gpu_active.store(false, Ordering::SeqCst);
                         ui::update();
                     }
-                    drop(jobs);
                 }
             });
         }
@@ -646,6 +729,7 @@ impl Broker {
             cpu: cpu_tx,
             background: bg_tx,
             shared_stats: common::shared_stats::SharedStats::create(),
+            cache_limit_mb: config.max_cache_mb,
         })
     }
     fn thumbnail(&self, path: PathBuf) -> Outcome {
@@ -654,12 +738,27 @@ impl Broker {
     fn thumbnail_priority(&self, path: PathBuf, background: bool) -> Outcome {
         let c = Config::load().map_err(|e| format!("{e:#}"))?;
         if let Some(image) = common::cache::find(&path, &c) {
+            if let Err(error) = cache_index::remember(&path, &image, &c) {
+                cache_index::log(&error);
+            }
             self.state
                 .hits
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(image);
         }
+        if let Err(message) = check_model_size(&path, &c) {
+            let key = common::cache::identity(&path, &c).unwrap_or_default();
+            activity(&self.state, &key, &path, message.clone(), false);
+            activity(&self.state, &key, &path, message.clone(), true);
+            ui::update();
+            return Err(message);
+        }
         let key = common::cache::identity(&path, &c).map_err(|e| format!("{e:#}"))?;
+        if c.renderer == "look" {
+            if let Some(error) = cache_index::failed(&key).map_err(|e| format!("{e:#}"))? {
+                return Err(format!("Skipped: {} ({error})", path.display()));
+            }
+        }
         let job = {
             let mut jobs = self.state.jobs.lock().unwrap();
             if self
@@ -671,8 +770,15 @@ impl Broker {
             }
             if let Some(job) = jobs.get(&key) {
                 if !background {
-                    job.background
-                        .store(false, std::sync::atomic::Ordering::Release);
+                    if job
+                        .background
+                        .swap(false, std::sync::atomic::Ordering::AcqRel)
+                        && job.started.load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        self.state
+                            .promotions
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     if let Some(handle) = *job.child.lock().unwrap() {
                         child_priority(handle, false);
                     }
@@ -748,16 +854,18 @@ impl Broker {
     }
     fn status(&self) -> serde_json::Value {
         use std::sync::atomic::Ordering;
-        let (count, bytes) = common::cache::inventory();
+        let usage = cache_index::usage();
+        let (count, bytes) = usage.unwrap_or_default();
         let (memory, cpu) = process_metrics();
-        let current = self
+        let current_files = self
             .state
             .current
             .lock()
             .unwrap()
             .iter()
-            .next()
-            .map(|p| p.to_string_lossy().to_string());
+            .map(|p| p.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        let current = current_files.first();
         let scanning = self
             .state
             .scanning
@@ -765,8 +873,8 @@ impl Broker {
             .unwrap()
             .as_ref()
             .map(|p| p.to_string_lossy().to_string());
-        let limit = Config::load().map(|v| v.max_cache_mb).unwrap_or(0);
-        serde_json::json!({"queued":self.state.jobs.lock().unwrap().len(),"gpu":if self.state.gpu_active.load(Ordering::SeqCst){"in use"}else{"released"},"success":self.state.success.load(Ordering::Relaxed),"failures":self.state.failures.load(Ordering::Relaxed),"cache_hits":self.state.hits.load(Ordering::Relaxed)+self.shared_stats.as_ref().map(|v|v.hits()).unwrap_or(0),"cache_files":count,"cache_bytes":bytes,"paused":*self.state.paused.lock().unwrap(),"preflight_pending":self.state.preflight_pending.load(Ordering::Relaxed),"scans_started":self.state.scans_started.load(Ordering::Relaxed),"journal_passes":self.state.journal_passes.load(Ordering::Relaxed),"source_bytes":self.state.source_bytes.load(Ordering::Relaxed),"promotions":self.state.promotions.load(Ordering::Relaxed),"current":current,"scanning":scanning,"memory_bytes":memory,"cpu_seconds":cpu,"cache_limit_mb":limit,"recent":self.state.recent.lock().unwrap().iter().cloned().collect::<Vec<_>>()})
+        let limit = self.cache_limit_mb;
+        serde_json::json!({"queued":self.state.jobs.lock().unwrap().len(),"gpu":if self.state.gpu_active.load(Ordering::SeqCst){"in use"}else{"released"},"success":self.state.success.load(Ordering::Relaxed),"failures":self.state.failures.load(Ordering::Relaxed),"cache_hits":self.state.hits.load(Ordering::Relaxed)+self.shared_stats.as_ref().map(|v|v.hits()).unwrap_or(0),"cache_inventory_passes":cache_index::inventory_passes(),"cache_ready":usage.is_some(),"cache_files":count,"cache_bytes":bytes,"paused":*self.state.paused.lock().unwrap(),"preflight_pending":self.state.preflight_pending.load(Ordering::Relaxed),"scans_started":self.state.scans_started.load(Ordering::Relaxed),"journal_passes":self.state.journal_passes.load(Ordering::Relaxed),"source_bytes":self.state.source_bytes.load(Ordering::Relaxed),"promotions":self.state.promotions.load(Ordering::Relaxed),"current":current,"current_files":current_files,"scanning":scanning,"memory_bytes":memory,"cpu_seconds":cpu,"cache_limit_mb":limit,"recent":self.state.recent.lock().unwrap().iter().map(|entry|entry.text.clone()).collect::<Vec<_>>()})
     }
 }
 fn serve(broker: Arc<Broker>) -> Result<()> {
@@ -780,11 +888,7 @@ fn serve(broker: Arc<Broker>) -> Result<()> {
                     Ok(path) => Response::image(&path),
                     Err(e) => Response::error(e),
                 },
-                Ok(Request::Status) => Response {
-                    image: None,
-                    error: None,
-                    status: Some(b.status()),
-                },
+                Ok(Request::Status) => Response::status(b.status()),
                 Ok(Request::Pause { paused }) => {
                     let mut p = b.state.paused.lock().unwrap();
                     *p = paused;
@@ -816,6 +920,9 @@ fn serve(broker: Arc<Broker>) -> Result<()> {
 }
 fn main() -> Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
+    if args.get(1).map(String::as_str) == Some("--import-worker") {
+        return import_worker::run(args.get(2).and_then(|v| v.parse().ok()).unwrap_or(1));
+    }
     if args.get(1).map(String::as_str) == Some("--wait-for") {
         if let Some(pid) = args.get(2).and_then(|v| v.parse::<u32>().ok()) {
             unsafe {
@@ -879,7 +986,12 @@ fn main() -> Result<()> {
         Some("--snapshot" | "--snapshot-filetypes")
     ) {
         let path = Path::new(args.get(2).context("Expected snapshot directory")?);
-        return ui::snapshot(Broker::new(), path, args[1] == "--snapshot-filetypes");
+        return ui::snapshot(
+            Broker::new(),
+            path,
+            args[1] == "--snapshot-filetypes",
+            args.get(3).and_then(|v| v.parse().ok()).unwrap_or(96),
+        );
     }
     if args.get(1).map(String::as_str) == Some("--promotion-test") {
         let path = Path::new(args.get(2).context("Expected model path")?).to_path_buf();

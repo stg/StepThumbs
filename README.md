@@ -20,6 +20,7 @@ its GPU resources. No service, no polling, and no CPU/GPU work while idle.
 It supports **STEP, STP, STL and GLB**, with source colours, edges, ambient
 occlusion and transparent or coloured backgrounds. The quiet **3D** tray icon
 opens activity, cache usage and settings for folders, file types and rendering.
+Limit model size and background workers to keep larger jobs under control.
 
 ## Install
 

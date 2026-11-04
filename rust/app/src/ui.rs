@@ -1,5 +1,6 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 use crate::{Broker, Config, common};
+mod layout;
 use std::{
     ptr::{null, null_mut},
     sync::{
@@ -15,9 +16,13 @@ use windows_sys::Win32::{
 };
 static BROKER: OnceLock<Arc<Broker>> = OnceLock::new();
 static WINDOW: AtomicIsize = AtomicIsize::new(0);
+static QUIT_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static UPDATE_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static mut FONT: HFONT = null_mut();
 static SNAPSHOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static INITIAL_PAGE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static SNAPSHOT_DPI: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(96);
+static COMPACT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const TRAY: u32 = WM_APP + 1;
 const UPDATE: u32 = WM_APP + 2;
 const SHOW: u32 = WM_APP + 3;
@@ -44,6 +49,7 @@ fn restart(page: usize) {
     });
 }
 pub fn quit() {
+    QUIT_REQUESTED.store(true, Ordering::Release);
     let h = WINDOW.load(Ordering::Acquire) as HWND;
     if !h.is_null() {
         unsafe {
@@ -61,9 +67,11 @@ pub fn show() {
 }
 pub fn update() {
     let h = WINDOW.load(Ordering::Acquire) as HWND;
-    if !h.is_null() {
+    if !h.is_null() && !UPDATE_PENDING.swap(true, Ordering::AcqRel) {
         unsafe {
-            PostMessageW(h, UPDATE, 0, 0);
+            if PostMessageW(h, UPDATE, 0, 0) == 0 {
+                UPDATE_PENDING.store(false, Ordering::Release);
+            }
         }
     }
 }
@@ -78,11 +86,20 @@ unsafe fn control(
     h: i32,
     id: usize,
 ) -> HWND {
+    let logical = [x, y, w, h];
+    let [x, y, w, h] = layout::rect(logical);
     let window = CreateWindowExW(
         0,
         common::wide(kind).as_ptr(),
         common::wide(text).as_ptr(),
-        WS_CHILD | WS_VISIBLE | style,
+        WS_CHILD
+            | WS_VISIBLE
+            | style
+            | if kind == "BUTTON" || kind == "EDIT" {
+                WS_TABSTOP
+            } else {
+                0
+            },
         x,
         y,
         w,
@@ -92,6 +109,7 @@ unsafe fn control(
         GetModuleHandleW(null()),
         null(),
     );
+    layout::add(window, logical);
     if !FONT.is_null() {
         SendMessageW(window, WM_SETFONT, FONT as usize, 1);
     }
@@ -115,10 +133,13 @@ unsafe fn checked(h: HWND, v: bool) {
 struct Controls {
     pages: [Vec<HWND>; 4],
     labels: HWND,
+    recent: HWND,
     roots: HWND,
     exclude: HWND,
     settle: HWND,
     limit: HWND,
+    workers: HWND,
+    max_file: HWND,
     startup: HWND,
     hooks: [HWND; 4],
     render_fields: Vec<HWND>,
@@ -140,19 +161,34 @@ unsafe fn page(index: usize) {
 unsafe fn status() {
     if !STATE.is_null() {
         let s = BROKER.get().unwrap().status();
+        let cache = if s["cache_ready"].as_bool().unwrap_or(false) {
+            format!(
+                "Cache: {} images, {:.1} / {} MiB",
+                s["cache_files"],
+                s["cache_bytes"].as_u64().unwrap_or(0) as f64 / 1048576.0,
+                s["cache_limit_mb"]
+            )
+        } else {
+            "Cache: counting existing thumbnails".to_owned()
+        };
         let text = format!(
-            "Model: {}\r\nScanning: {}\r\nQueued: {}  (preflight {})     GPU: {}\r\nRendered: {}     Failures: {}     Cache hits: {}\r\nCache: {} files, {:.1} / {} MiB\r\nModel bytes this session: {:.1} MiB\r\nProcess memory: {:.1} MiB     CPU time: {:.1} s",
-            s["current"].as_str().unwrap_or("Idle"),
-            s["scanning"].as_str().unwrap_or("Idle"),
+            "Preflight: {}     GPU: {}\r\nQueued: {}  (preflight {})\r\nRendered: {}     Failures: {}     Cache hits: {}\r\n{}\r\nModel bytes this session: {:.1} MiB\r\nProcess memory: {:.1} MiB     CPU time: {:.1} s",
+            if s["paused"].as_bool().unwrap_or(false) {
+                "Paused"
+            } else if s["scanning"].is_string() {
+                "Scanning"
+            } else if s["queued"].as_u64().unwrap_or(0) > 0 {
+                "Preparing"
+            } else {
+                "Idle"
+            },
+            s["gpu"].as_str().unwrap_or("unknown"),
             s["queued"],
             s["preflight_pending"],
-            s["gpu"].as_str().unwrap_or("unknown"),
             s["success"],
             s["failures"],
             s["cache_hits"],
-            s["cache_files"],
-            s["cache_bytes"].as_u64().unwrap_or(0) as f64 / 1048576.0,
-            s["cache_limit_mb"],
+            cache,
             s["source_bytes"].as_u64().unwrap_or(0) as f64 / 1048576.0,
             s["memory_bytes"].as_u64().unwrap_or(0) as f64 / 1048576.0,
             s["cpu_seconds"].as_f64().unwrap_or(0.0)
@@ -166,10 +202,10 @@ unsafe fn status() {
                     .join("\r\n")
             })
             .unwrap_or_default();
-        settext(
-            (*STATE).labels,
-            &format!("{text}\r\n\r\nRecent activity:\r\n{recent}"),
-        );
+        settext((*STATE).labels, &text);
+        if get((*STATE).recent) != recent {
+            settext((*STATE).recent, &recent);
+        }
     }
 }
 unsafe fn icon(bytes: &[u8], desired: i32) -> HICON {
@@ -262,23 +298,20 @@ unsafe extern "system" fn window(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
 unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_CREATE => {
-            let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd).max(96);
-            FONT = CreateFontW(
-                -((9 * dpi as i32) / 72),
-                0,
-                0,
-                0,
-                400,
-                0,
-                0,
-                0,
-                1,
-                0,
-                0,
-                5,
-                0,
-                common::wide("Segoe UI").as_ptr(),
+            let dpi = if SNAPSHOT.load(Ordering::Relaxed) {
+                SNAPSHOT_DPI.load(Ordering::Relaxed)
+            } else {
+                windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd).max(96)
+            };
+            layout::init(
+                dpi,
+                if COMPACT.load(Ordering::Relaxed) {
+                    256
+                } else {
+                    layout::HEIGHT
+                },
             );
+            FONT = layout::font();
             let cfg = Config::load().unwrap_or_default();
             let mut pages: [Vec<HWND>; 4] = Default::default();
             for (i, name) in ["Activity", "Settings", "File types", "Rendering"]
@@ -287,8 +320,37 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
             {
                 button(hwnd, name, 12 + i as i32 * 130, 10, 120, 10 + i);
             }
-            let labels = control(hwnd, "STATIC", "", 0, 20, 60, 650, 310, 0);
+            let labels = control(hwnd, "STATIC", "", 0, 20, 55, 628, 115, 0);
             pages[0].push(labels);
+            pages[0].push(control(
+                hwnd,
+                "STATIC",
+                "Recent activity",
+                0,
+                20,
+                177,
+                628,
+                18,
+                0,
+            ));
+            let recent = control(
+                hwnd,
+                "EDIT",
+                "",
+                WS_BORDER
+                    | ES_MULTILINE as u32
+                    | ES_READONLY as u32
+                    | ES_AUTOHSCROLL as u32
+                    | WS_HSCROLL
+                    | WS_VSCROLL,
+                20,
+                200,
+                628,
+                158,
+                0,
+            );
+            pages[0].push(recent);
+            pages[0].push(button(hwnd, "Open cache folder", 20, 373, 160, 105));
             let mut add = |page: usize, h: HWND| {
                 pages[page].push(h);
                 h
@@ -341,7 +403,7 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
             );
             add(
                 1,
-                control(hwnd, "STATIC", "Settle seconds", 0, 20, 202, 120, 20, 0),
+                control(hwnd, "STATIC", "Settle seconds", 0, 20, 229, 120, 20, 0),
             );
             let settle = add(
                 1,
@@ -351,7 +413,7 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
                     &cfg.settle_seconds.to_string(),
                     WS_BORDER,
                     145,
-                    200,
+                    225,
                     80,
                     24,
                     0,
@@ -359,7 +421,7 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
             );
             add(
                 1,
-                control(hwnd, "STATIC", "Cache limit MiB", 0, 245, 202, 110, 20, 0),
+                control(hwnd, "STATIC", "Cache limit MiB", 0, 340, 229, 155, 20, 0),
             );
             let limit = add(
                 1,
@@ -368,10 +430,84 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
                     "EDIT",
                     &cfg.max_cache_mb.to_string(),
                     WS_BORDER,
-                    360,
-                    200,
-                    100,
+                    500,
+                    225,
+                    140,
                     24,
+                    0,
+                ),
+            );
+            let workers = add(
+                1,
+                control(
+                    hwnd,
+                    "EDIT",
+                    &cfg.background_workers.to_string(),
+                    WS_BORDER | ES_NUMBER as u32,
+                    145,
+                    265,
+                    80,
+                    24,
+                    0,
+                ),
+            );
+            add(
+                1,
+                control(hwnd, "STATIC", "Background workers", 0, 20, 269, 125, 20, 0),
+            );
+            let max_file = add(
+                1,
+                control(
+                    hwnd,
+                    "EDIT",
+                    &cfg.max_file_mb.to_string(),
+                    WS_BORDER | ES_NUMBER as u32,
+                    500,
+                    265,
+                    140,
+                    24,
+                    0,
+                ),
+            );
+            add(
+                1,
+                control(
+                    hwnd,
+                    "STATIC",
+                    "Max model size MiB",
+                    0,
+                    340,
+                    269,
+                    155,
+                    20,
+                    0,
+                ),
+            );
+            add(
+                1,
+                control(
+                    hwnd,
+                    "STATIC",
+                    "Size 0 = unlimited. More workers use more RAM while preparing models.",
+                    0,
+                    20,
+                    302,
+                    628,
+                    20,
+                    0,
+                ),
+            );
+            add(
+                1,
+                control(
+                    hwnd,
+                    "STATIC",
+                    "Exclusions only affect preflighting; requested thumbnails still render.",
+                    0,
+                    20,
+                    191,
+                    628,
+                    20,
                     0,
                 ),
             );
@@ -383,14 +519,14 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
                     "Start with Windows",
                     BS_AUTOCHECKBOX as u32,
                     20,
-                    240,
+                    335,
                     250,
                     25,
                     0,
                 ),
             );
             checked(startup, common::hooks::startup_enabled());
-            add(1, button(hwnd, "Save settings", 20, 280, 150, 40));
+            add(1, button(hwnd, "Save settings", 20, 372, 150, 40));
             let mut hooks = [null_mut(); 4];
             for (i, ext) in common::hooks::EXTENSIONS.iter().enumerate() {
                 let st = common::hooks::status(ext);
@@ -492,10 +628,13 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
             STATE = Box::into_raw(Box::new(Controls {
                 pages,
                 labels,
+                recent,
                 roots,
                 exclude,
                 settle,
                 limit,
+                workers,
+                max_file,
                 startup,
                 hooks,
                 render_fields,
@@ -533,6 +672,8 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
                             .collect();
                         cfg.settle_seconds = get(s.settle).parse()?;
                         cfg.max_cache_mb = get(s.limit).parse()?;
+                        cfg.background_workers = get(s.workers).parse()?;
+                        cfg.max_file_mb = get(s.max_file).parse()?;
                         cfg.start_with_windows = check(s.startup);
                         cfg.save()?;
                         common::hooks::startup(cfg.start_with_windows, &std::env::current_exe()?)?;
@@ -636,14 +777,24 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
                 100 => {
                     page(0);
                     status();
-                    ShowWindow(hwnd, SW_SHOW);
-                    SetForegroundWindow(hwnd);
+                    layout::show(hwnd);
                 }
                 104 => {
                     page(2);
                     status();
-                    ShowWindow(hwnd, SW_SHOW);
-                    SetForegroundWindow(hwnd);
+                    layout::show(hwnd);
+                }
+                105 => {
+                    let path = common::cache::directory();
+                    let _ = std::fs::create_dir_all(&path);
+                    ShellExecuteW(
+                        hwnd,
+                        common::wide("open").as_ptr(),
+                        common::wide(path).as_ptr(),
+                        null(),
+                        null(),
+                        SW_SHOW,
+                    );
                 }
                 103 => {
                     let log = common::data_dir().join("activity.log");
@@ -676,8 +827,7 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
         }
         TRAY => {
             if lp as u32 == WM_LBUTTONUP {
-                ShowWindow(hwnd, SW_SHOW);
-                SetForegroundWindow(hwnd);
+                layout::show(hwnd);
                 status();
             } else if lp as u32 == WM_RBUTTONUP {
                 let menu = CreatePopupMenu();
@@ -718,13 +868,25 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
         }
         WM_DPICHANGED => {
             let rect = &*(lp as *const RECT);
+            layout::set_dpi((wp as u32 & 0xffff).max(96));
+            let old_font = FONT;
+            FONT = layout::font();
+            layout::change_dpi(layout::dpi(), FONT);
+            if !old_font.is_null() {
+                DeleteObject(old_font);
+            }
+            let (width, height) = layout::size(if SNAPSHOT.load(Ordering::Relaxed) {
+                WS_EX_TOOLWINDOW
+            } else {
+                0
+            });
             SetWindowPos(
                 hwnd,
                 null_mut(),
                 rect.left,
                 rect.top,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
+                width,
+                height,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
             if !STATE.is_null() {
@@ -735,25 +897,49 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
                     (*STATE).icon = new;
                 }
             }
+            RedrawWindow(
+                hwnd,
+                null(),
+                null_mut(),
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME,
+            );
+            0
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
+            SetBkMode(wp as HDC, TRANSPARENT as i32);
+            SetTextColor(wp as HDC, GetSysColor(COLOR_BTNTEXT));
+            SetBkColor(wp as HDC, GetSysColor(COLOR_BTNFACE));
+            GetSysColorBrush(COLOR_BTNFACE) as LRESULT
+        }
+        WM_EXITSIZEMOVE => {
+            if !SNAPSHOT.load(Ordering::Relaxed) {
+                layout::save(hwnd);
+            }
             0
         }
         QUIT => {
+            if !SNAPSHOT.load(Ordering::Relaxed) {
+                layout::save(hwnd);
+            }
             DestroyWindow(hwnd);
             0
         }
         SHOW => {
-            ShowWindow(hwnd, SW_SHOW);
-            SetForegroundWindow(hwnd);
+            layout::show(hwnd);
             status();
             0
         }
         UPDATE => {
+            UPDATE_PENDING.store(false, Ordering::Release);
             if IsWindowVisible(hwnd) != 0 {
                 status();
             }
             0
         }
         WM_CLOSE => {
+            if !SNAPSHOT.load(Ordering::Relaxed) {
+                layout::save(hwnd);
+            }
             ShowWindow(hwnd, SW_HIDE);
             0
         }
@@ -783,6 +969,9 @@ pub fn run(broker: Arc<Broker>, visible: bool, initial_page: usize) -> anyhow::R
         .set(broker)
         .map_err(|_| anyhow::anyhow!("UI already running"))?;
     unsafe {
+        use windows_sys::Win32::System::Threading::*;
+        SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
         windows_sys::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
             windows_sys::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
         );
@@ -793,19 +982,20 @@ pub fn run(broker: Arc<Broker>, visible: bool, initial_page: usize) -> anyhow::R
             hInstance: inst,
             lpszClassName: class.as_ptr(),
             hCursor: LoadCursorW(null_mut(), IDC_ARROW),
-            hbrBackground: (COLOR_WINDOW + 1) as HBRUSH,
+            hbrBackground: (COLOR_BTNFACE + 1) as HBRUSH,
             ..std::mem::zeroed()
         };
         if RegisterClassW(&wc) == 0 {
             return Err(std::io::Error::last_os_error().into());
         }
+        let (x, y) = layout::initial_position();
         let hwnd = CreateWindowExW(
             0,
             class.as_ptr(),
             common::wide("StepThumbs").as_ptr(),
-            WS_OVERLAPPEDWINDOW,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
+            layout::STYLE,
+            x,
+            y,
             690,
             460,
             null_mut(),
@@ -817,8 +1007,10 @@ pub fn run(broker: Arc<Broker>, visible: bool, initial_page: usize) -> anyhow::R
             return Err(std::io::Error::last_os_error().into());
         }
         WINDOW.store(hwnd as isize, Ordering::Release);
-        if visible {
-            ShowWindow(hwnd, SW_SHOW);
+        if QUIT_REQUESTED.load(Ordering::Acquire) {
+            PostMessageW(hwnd, QUIT, 0, 0);
+        } else if visible {
+            layout::show(hwnd);
         }
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
@@ -834,8 +1026,11 @@ pub fn snapshot(
     broker: Arc<Broker>,
     folder: &std::path::Path,
     filetypes_only: bool,
+    dpi: u32,
 ) -> anyhow::Result<()> {
     SNAPSHOT.store(true, Ordering::Relaxed);
+    SNAPSHOT_DPI.store(dpi, Ordering::Relaxed);
+    COMPACT.store(filetypes_only, Ordering::Relaxed);
     BROKER
         .set(broker)
         .map_err(|_| anyhow::anyhow!("UI already running"))?;
@@ -848,7 +1043,7 @@ pub fn snapshot(
             hInstance: instance,
             lpszClassName: class.as_ptr(),
             hCursor: LoadCursorW(null_mut(), IDC_ARROW),
-            hbrBackground: (COLOR_WINDOW + 1) as HBRUSH,
+            hbrBackground: (COLOR_BTNFACE + 1) as HBRUSH,
             ..std::mem::zeroed()
         };
         if RegisterClassW(&wc) == 0 {
@@ -858,7 +1053,7 @@ pub fn snapshot(
             WS_EX_TOOLWINDOW,
             class.as_ptr(),
             common::wide("StepThumbs").as_ptr(),
-            WS_OVERLAPPEDWINDOW,
+            layout::STYLE,
             -32000,
             -32000,
             690,
@@ -871,6 +1066,16 @@ pub fn snapshot(
         if hwnd.is_null() {
             return Err(std::io::Error::last_os_error().into());
         }
+        let (width, height) = layout::size(WS_EX_TOOLWINDOW);
+        SetWindowPos(
+            hwnd,
+            null_mut(),
+            -32000,
+            -32000,
+            width,
+            height,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         let mut rect: RECT = std::mem::zeroed();
         GetWindowRect(hwnd, &mut rect);

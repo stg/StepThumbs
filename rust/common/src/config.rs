@@ -14,6 +14,10 @@ pub struct Config {
     pub settle_seconds: u64,
     #[serde(rename = "MaxCacheMB")]
     pub max_cache_mb: u64,
+    pub background_workers: usize,
+    #[serde(rename = "MaxFileMB")]
+    pub max_file_mb: u64,
+    pub import_timeout_seconds: u64,
     pub renderer: String,
     pub transparent: bool,
     pub background: String,
@@ -50,6 +54,9 @@ impl Default for Config {
             extensions: vec![".step".into(), ".stp".into()],
             settle_seconds: 3,
             max_cache_mb: 2048,
+            background_workers: 1,
+            max_file_mb: 0,
+            import_timeout_seconds: 30,
             renderer: "look".into(),
             transparent: true,
             background: "#ffffff".into(),
@@ -106,6 +113,15 @@ impl Config {
         if self.max_cache_mb > 1_048_576 {
             bail!("Cache limit is too large.");
         }
+        if !(1..=32).contains(&self.background_workers) {
+            bail!("Background workers must be between 1 and 32.");
+        }
+        if self.max_file_mb > 1_048_576 {
+            bail!("Maximum model size is too large.");
+        }
+        if !(1..=300).contains(&self.import_timeout_seconds) {
+            bail!("Import timeout must be between 1 and 300 seconds.");
+        }
         if self
             .extensions
             .iter()
@@ -155,6 +171,15 @@ impl Config {
                 .iter()
                 .any(|v| v[1..].eq_ignore_ascii_case(&e.to_string_lossy()))
         })
+    }
+    pub fn worker_count(&self) -> usize {
+        self.background_workers
+            .min(
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1),
+            )
+            .max(1)
     }
     pub fn included(&self, path: &Path) -> bool {
         self.roots.iter().any(|p| crate::below(path, Path::new(p)))

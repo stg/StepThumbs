@@ -36,7 +36,7 @@ impl Response {
     pub fn error(e: impl ToString) -> Self {
         Self {
             image: None,
-            error: Some(e.to_string()),
+            error: Some(crate::brief_error(&e.to_string())),
             status: None,
         }
     }
@@ -46,6 +46,30 @@ impl Response {
             error: None,
             status: None,
         }
+    }
+    pub fn status(status: serde_json::Value) -> Self {
+        let mut response = Self {
+            image: None,
+            error: None,
+            status: Some(status),
+        };
+        while serde_json::to_vec(&response).map_or(true, |v| v.len() > 60_000) {
+            let status = response.status.as_mut().unwrap();
+            status["details_truncated"] = true.into();
+            if ["recent", "current_files"].iter().any(|field| {
+                status[*field]
+                    .as_array_mut()
+                    .is_some_and(|items| items.pop().is_some())
+            }) {
+                continue;
+            }
+            status["current"] = serde_json::Value::Null;
+            status["scanning"] = serde_json::Value::Null;
+            if serde_json::to_vec(&response).map_or(true, |v| v.len() > 60_000) {
+                return Self::error("Status details exceed the message limit");
+            }
+        }
+        response
     }
 }
 pub fn pipe_name() -> String {
