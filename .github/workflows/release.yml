@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Installer version (for example 0.3.4); artifacts only'
+        description: 'Installer version (for example 0.3.5); artifacts only'
         required: true
-        default: '0.3.4'
+        default: '0.3.5'
 
 permissions:
   contents: read

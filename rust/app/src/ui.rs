@@ -28,6 +28,8 @@ static WINDOW: AtomicIsize = AtomicIsize::new(0);
 static QUIT_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static UPDATE_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static mut FONT: HFONT = null_mut();
+static mut TRAY_ICON: HICON = null_mut();
+static mut APP_ICON: HICON = null_mut();
 static SNAPSHOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static INITIAL_PAGE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static SNAPSHOT_DPI: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(96);
@@ -174,10 +176,19 @@ struct Controls {
     preview_path: Option<std::path::PathBuf>,
     preview_revision: u64,
     preview_pixels: Option<Vec<u8>>,
-    icon: HICON,
-    task_icon: HICON,
 }
 static mut STATE: *mut Controls = null_mut();
+unsafe fn initialize_controls(hwnd: HWND) {
+    if !STATE.is_null() {
+        return;
+    }
+    FONT = layout::font();
+    let cfg = Config::load().unwrap_or_default();
+    STATE = Box::into_raw(Box::new(forms::build(hwnd, &cfg)));
+    enable_rendering();
+    page(INITIAL_PAGE.load(Ordering::Relaxed));
+    status();
+}
 unsafe fn page(index: usize) {
     if STATE.is_null() {
         return;
@@ -475,22 +486,27 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
                     layout::HEIGHT
                 },
             );
-            FONT = layout::font();
-            let cfg = Config::load().unwrap_or_default();
-            STATE = Box::into_raw(Box::new(forms::build(hwnd, &cfg)));
-            enable_rendering();
+            TRAY_ICON = tray_icon(hwnd);
+            APP_ICON = icon(include_bytes!("../assets/app.ico"), 32);
+            SendMessageW(hwnd, WM_SETICON, 1, APP_ICON as isize);
+            SendMessageW(hwnd, WM_SETICON, 0, APP_ICON as isize);
             if !SNAPSHOT.load(Ordering::Relaxed) {
-                notify(hwnd, NIM_ADD, (*STATE).icon);
+                notify(hwnd, NIM_ADD, TRAY_ICON);
+            } else {
+                initialize_controls(hwnd);
             }
-            page(INITIAL_PAGE.load(Ordering::Relaxed));
-            status();
             0
         }
         WM_COMMAND => {
-            if STATE.is_null() {
+            let id = (wp & 0xffff) as usize;
+            // Child controls can notify the parent before their construction
+            // has returned and STATE has been assigned.
+            if STATE.is_null() && lp != 0 {
                 return 0;
             }
-            let id = (wp & 0xffff) as usize;
+            if STATE.is_null() && !matches!(id, 101 | 102 | 103 | 105) {
+                initialize_controls(hwnd);
+            }
             let notification = (wp >> 16) as u32;
             match id {
                 200..=210 | 230..=234 if notification == EN_CHANGE || notification == CBN_SELCHANGE || notification == BN_CLICKED => {
@@ -674,7 +690,7 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
         WM_NOTIFY => {
             use windows_sys::Win32::UI::Controls::*;
             let notification = &*(lp as *const NMHDR);
-            if notification.idFrom == 9 && notification.code == TCN_SELCHANGE {
+            if !STATE.is_null() && notification.idFrom == 9 && notification.code == TCN_SELCHANGE {
                 page(SendMessageW((*STATE).tabs, TCM_GETCURSEL, 0, 0) as usize);
                 status();
             }
@@ -695,6 +711,7 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
         }
         TRAY => {
             if lp as u32 == WM_LBUTTONUP {
+                initialize_controls(hwnd);
                 layout::show(hwnd);
                 schedule_preview(hwnd);
                 status();
@@ -725,13 +742,11 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
             0
         }
         WM_SETTINGCHANGE | WM_THEMECHANGED => {
-            if !STATE.is_null() {
-                let new = tray_icon(hwnd);
-                if !new.is_null() {
-                    notify(hwnd, NIM_MODIFY, new);
-                    DestroyIcon((*STATE).icon);
-                    (*STATE).icon = new;
-                }
+            let new = tray_icon(hwnd);
+            if !new.is_null() {
+                notify(hwnd, NIM_MODIFY, new);
+                DestroyIcon(TRAY_ICON);
+                TRAY_ICON = new;
             }
             DefWindowProcW(hwnd, msg, wp, lp)
         }
@@ -739,9 +754,9 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
             let rect = &*(lp as *const RECT);
             layout::set_dpi((wp as u32 & 0xffff).max(96));
             let old_font = FONT;
-            FONT = layout::font();
-            layout::change_dpi(layout::dpi(), FONT);
             if !STATE.is_null() {
+                FONT = layout::font();
+                layout::change_dpi(layout::dpi(), FONT);
                 tab_size((*STATE).tabs);
                 list_extent((*STATE).roots);
                 list_extent((*STATE).exclude);
@@ -763,13 +778,11 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
                 height,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
-            if !STATE.is_null() {
-                let new = tray_icon(hwnd);
-                if !new.is_null() {
-                    notify(hwnd, NIM_MODIFY, new);
-                    DestroyIcon((*STATE).icon);
-                    (*STATE).icon = new;
-                }
+            let new = tray_icon(hwnd);
+            if !new.is_null() {
+                notify(hwnd, NIM_MODIFY, new);
+                DestroyIcon(TRAY_ICON);
+                TRAY_ICON = new;
             }
             RedrawWindow(
                 hwnd,
@@ -806,6 +819,7 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
             0
         }
         SHOW => {
+            initialize_controls(hwnd);
             layout::show(hwnd);
             schedule_preview(hwnd);
             status();
@@ -827,12 +841,14 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
             0
         }
         WM_DESTROY => {
+            if !SNAPSHOT.load(Ordering::Relaxed) {
+                notify(hwnd, NIM_DELETE, TRAY_ICON);
+            }
+            DestroyIcon(TRAY_ICON);
+            DestroyIcon(APP_ICON);
+            TRAY_ICON = null_mut();
+            APP_ICON = null_mut();
             if !STATE.is_null() {
-                if !SNAPSHOT.load(Ordering::Relaxed) {
-                    notify(hwnd, NIM_DELETE, (*STATE).icon);
-                }
-                DestroyIcon((*STATE).icon);
-                DestroyIcon((*STATE).task_icon);
                 drop(Box::from_raw(STATE));
                 STATE = null_mut();
             }
@@ -893,6 +909,7 @@ pub fn run(broker: Arc<Broker>, visible: bool, initial_page: usize) -> anyhow::R
         if QUIT_REQUESTED.load(Ordering::Acquire) {
             PostMessageW(hwnd, QUIT, 0, 0);
         } else if visible {
+            initialize_controls(hwnd);
             layout::show(hwnd);
             schedule_preview(hwnd);
         }

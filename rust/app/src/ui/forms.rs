@@ -353,10 +353,6 @@ pub unsafe fn build(hwnd: HWND, cfg: &Config) -> Controls {
     );
     add(3, button(hwnd, "Load preview file", 362, 333, 138, 81));
     add(3, button(hwnd, "Use default", 508, 333, 124, 82));
-    let ico = tray_icon(hwnd);
-    let task_icon = icon(include_bytes!("../../assets/app.ico"), 32);
-    SendMessageW(hwnd, WM_SETICON, 1, task_icon as isize);
-    SendMessageW(hwnd, WM_SETICON, 0, task_icon as isize);
     Controls {
         pages,
         tabs,
@@ -380,8 +376,6 @@ pub unsafe fn build(hwnd: HWND, cfg: &Config) -> Controls {
         preview_path: None,
         preview_revision: 0,
         preview_pixels: None,
-        icon: ico,
-        task_icon,
     }
 }
 unsafe fn combo(h: HWND, values: &[&str], selected: usize) {

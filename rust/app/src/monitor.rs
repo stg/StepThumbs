@@ -17,16 +17,16 @@ use std::{
 use windows_sys::Win32::{Foundation::*, Storage::FileSystem::*};
 #[derive(Serialize, Deserialize, Default)]
 #[serde(rename_all = "PascalCase", default)]
-struct Checkpoint {
+struct Checkpoint<P = String> {
     version: u32,
     signature: String,
     cursors: HashMap<String, Cursor>,
-    files: Vec<String>,
-    directories: Vec<String>,
+    files: Vec<P>,
+    directories: Vec<P>,
     renderer_profile: String,
-    known_files: Vec<String>,
+    known_files: Vec<P>,
     max_file_mb: Option<u64>,
-    failed_files: Vec<String>,
+    failed_files: Vec<P>,
 }
 enum Event {
     File(PathBuf, bool),
@@ -253,16 +253,16 @@ fn save(
     known: &HashSet<PathBuf>,
     failed: &HashSet<PathBuf>,
 ) -> anyhow::Result<()> {
-    let c = Checkpoint {
+    let c = Checkpoint::<std::borrow::Cow<'_, str>> {
         version: 2,
         signature: signature(cfg, true),
         cursors: cursors.clone(),
-        files: files.keys().map(|p| p.to_string_lossy().into()).collect(),
-        directories: dirs.iter().map(|p| p.to_string_lossy().into()).collect(),
+        files: files.keys().map(|p| p.to_string_lossy()).collect(),
+        directories: dirs.iter().map(|p| p.to_string_lossy()).collect(),
         renderer_profile: cfg.profile(),
-        known_files: known.iter().map(|p| p.to_string_lossy().into()).collect(),
+        known_files: known.iter().map(|p| p.to_string_lossy()).collect(),
         max_file_mb: Some(cfg.max_file_mb),
-        failed_files: failed.iter().map(|p| p.to_string_lossy().into()).collect(),
+        failed_files: failed.iter().map(|p| p.to_string_lossy()).collect(),
     };
     common::cache::atomic_write(
         &common::data_dir().join("checkpoint-v2.json"),
@@ -586,6 +586,9 @@ fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
             }
         }
     }
+    // The restored checkpoint is only needed during startup. Keeping it here
+    // otherwise duplicates every known source path for the lifetime of the app.
+    drop(saved);
     let mut active_files: HashSet<PathBuf> = HashSet::new();
     let mut changed_active: HashSet<PathBuf> = HashSet::new();
     let mut active_dir: Option<PathBuf> = None;
