@@ -15,7 +15,7 @@ an upgrade.
   cache miss gets foreground priority.
 - **Windows clearing its cache doesn't mean starting over.** StepThumbs keeps
   its own disk cache, which Explorer's thumbnail provider checks first.
-- **Low RAM, no CPU/GPU work while idle.** About 31 MiB of idle RAM in local
+- **Low RAM. Zero CPU/GPU work while idle.** About 31 MiB of idle RAM in local
   tests, with the app sleeping between jobs and releasing GPU resources.
   No Windows service or periodic rescans.
 - **STEP, STP, STL and GLB.** Render with source colours, edges, ambient occlusion
@@ -33,8 +33,9 @@ an upgrade.
 4. Tick the extensions you want, click **Install selected preview hooks**, then
    choose **Yes** to replace the listed providers.
 
-Use **Large icons** or **Extra large icons** in Explorer to see the thumbnails.
-StepThumbs starts quietly with Windows after that.
+   Optionally select **Start with Windows** under **Settings** and click
+   **Save settings**.
+5. Use **Large icons** or **Extra large icons** in Explorer to see the thumbnails.
 
 <img src="assets/file-types.png" width="640" alt="StepThumbs File types settings with extension checkboxes, provider status and the install button">
 
