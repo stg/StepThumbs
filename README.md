@@ -17,7 +17,8 @@ an upgrade.
   its own disk cache, which Explorer's thumbnail provider checks first.
 - **Low RAM. Zero CPU/GPU work while idle.** About 31 MiB of idle RAM in local
   tests, with the app sleeping between jobs and releasing GPU resources.
-  No Windows service or periodic rescans.
+  No Windows service or periodic rescans; filesystem notifications and Explorer
+  thumbnail requests wake it when needed.
 - **STEP, STP, STL and GLB.** Render with source colours, edges, ambient occlusion
   and transparent or coloured backgrounds; try changes in the live preview
   using the supplied model or your own.
