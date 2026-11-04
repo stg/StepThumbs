@@ -1,0 +1,26 @@
+Third-party software
+
+StepThumbs's own source is MIT licensed; see the application's LICENSE.
+
+StepThumbs statically links Look, created by Stefan Golas and contributors.
+Upstream: https://github.com/stefangolas/look
+Renderer fork: https://github.com/stg/look
+Look is licensed under MIT OR Apache-2.0. Both upstream license texts accompany
+the source in licenses/look and the installed binary in its look package folder.
+The application repository pins an exact Look commit as a Git submodule.
+
+Our changes add GPU ambient occlusion, crease/silhouette outlines, transparent
+output, CAD material shading, bounded GPU readback waits and cooperative import
+cancellation. Look modifications retain the upstream MIT OR Apache-2.0 terms.
+The Look name does not imply upstream endorsement of StepThumbs.
+
+Look uses Truck and ruststep for STEP import/tessellation, and wgpu for rendering.
+The generated packages.json lists the production dependency graph's versions,
+declared licenses, authors and source repositories. Each package folder contains
+its license/notice texts. A few source packages omitted these from their crate
+archive; licenses/extra supplies upstream copies with source-revision URLs.
+Truck's truck-assembly crate follows its upstream repository's Apache-2.0 license.
+This licenses directory must accompany binary redistribution.
+
+F3D (https://f3d.app/) is an optional, separately installed renderer. Its source
+and binaries are not included in StepThumbs.

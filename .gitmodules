@@ -1,0 +1,3 @@
+[submodule "look"]
+	path = third_party/look
+	url = https://github.com/stg/look.git

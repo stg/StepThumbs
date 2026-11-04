@@ -1,0 +1,86 @@
+name: Windows installer
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Installer version (for example 0.3.0); artifacts only'
+        required: true
+        default: '0.3.0'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - name: Read version
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          $version = if ($env:EVENT_NAME -eq 'push') { $env:RELEASE_TAG -replace '^v', '' } else { $env:INPUT_VERSION }
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'Use a numeric x.y.z version.' }
+          "value=$version" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.96.1 --profile minimal
+          if ($LASTEXITCODE) { throw 'Rust installation failed.' }
+          rustup default 1.96.1
+          if ($LASTEXITCODE) { throw 'Rust selection failed.' }
+      - name: Build native app and shell provider
+        run: |
+          cargo build --release --locked
+          if ($LASTEXITCODE) { throw 'Native build failed.' }
+      - name: Check provider installation and restoration
+        run: |
+          $stdout = Join-Path $env:RUNNER_TEMP 'hooks-test.out.txt'
+          $stderr = Join-Path $env:RUNNER_TEMP 'hooks-test.err.txt'
+          $test = Start-Process -FilePath target/release/StepThumbs.exe -ArgumentList '--hooks-self-test' -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          Get-Content -LiteralPath $stdout
+          if ($test.ExitCode) { Get-Content -LiteralPath $stderr; throw 'Provider self-test failed.' }
+      - name: Build installer and licenses
+        env:
+          APP_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          $setup = Join-Path $env:RUNNER_TEMP 'innosetup-7.1.1-x64.exe'
+          $compilerDir = Join-Path $env:RUNNER_TEMP 'inno7'
+          Invoke-WebRequest 'https://github.com/jrsoftware/issrc/releases/download/is-7_1_1/innosetup-7.1.1-x64.exe' -OutFile $setup
+          $expected = '8A5A6711C3766A6E5FB74F280BA0E3551E719CE94538D901FDBD1F8F9920B3F0'
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $setup).Hash -ne $expected) { throw 'Inno checksum mismatch.' }
+          $process = Start-Process -FilePath $setup -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER','/NOICONS',('/DIR="' + $compilerDir + '"')) -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode) { throw 'Inno installation failed.' }
+          cargo xtask dist --version $env:APP_VERSION --compiler (Join-Path $compilerDir 'ISCC.exe') --skip-build
+          if ($LASTEXITCODE) { throw 'Installer packaging failed.' }
+      - name: Keep installer artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: StepThumbs-${{ steps.version.outputs.value }}-windows-x64
+          path: |
+            dist/StepThumbs-*-Setup.exe
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+      - name: Publish tagged release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          APP_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          gh release create $env:RELEASE_TAG "dist/StepThumbs-$env:APP_VERSION-Setup.exe" dist/SHA256SUMS.txt --verify-tag --title "StepThumbs $env:APP_VERSION" --generate-notes
+          if ($LASTEXITCODE) { throw 'Release publication failed.' }

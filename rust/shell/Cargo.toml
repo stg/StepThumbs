@@ -1,0 +1,13 @@
+[package]
+name = "stepthumbnail-shell"
+version = "0.3.0"
+license = "MIT"
+edition = "2024"
+[lib]
+name = "StepThumbsShell"
+crate-type = ["cdylib"]
+[dependencies]
+stepthumbnail-common = { path = "../common" }
+windows-sys.workspace = true
+image.workspace = true
+anyhow.workspace = true

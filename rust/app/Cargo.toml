@@ -1,0 +1,21 @@
+[package]
+name = "stepthumbnail-app"
+version = "0.3.0"
+license = "MIT"
+edition = "2024"
+build = "build.rs"
+[[bin]]
+name = "StepThumbs"
+path = "src/main.rs"
+[dependencies]
+stepthumbnail-common = { path = "../common" }
+look = { path = "../../third_party/look" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+sha2.workspace = true
+windows-sys.workspace = true
+image.workspace = true
+rayon.workspace = true
+winreg.workspace = true

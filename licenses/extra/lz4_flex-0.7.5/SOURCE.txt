@@ -1,0 +1,1 @@
+﻿https://raw.githubusercontent.com/pseitz/lz4_flex/c3cf4c8bdacedc517f3e20bc6d591cf4780c7e29/LICENSE

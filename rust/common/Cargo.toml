@@ -1,0 +1,13 @@
+[package]
+name = "stepthumbnail-common"
+version = "0.3.0"
+license = "MIT"
+edition = "2024"
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+sha2.workspace = true
+winreg.workspace = true
+windows-sys.workspace = true

@@ -1,0 +1,35 @@
+[workspace]
+members = ["rust/common", "rust/shell", "rust/app", "rust/xtask"]
+default-members = ["rust/common", "rust/shell", "rust/app"]
+exclude = ["third_party/look"]
+resolver = "2"
+
+[workspace.dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+blake3 = "1.8"
+sha2 = "0.10"
+image = { version = "0.25", default-features = false, features = ["png"] }
+rayon = "1.11"
+winreg = "0.55"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_Storage_Xps", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_System_SystemInformation", "Win32_System_ProcessStatus", "Win32_System_Memory", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_UI_Controls", "Win32_UI_Controls_Dialogs", "Win32_UI_HiDpi", "Win32_System_Com", "Win32_System_Console"] }
+
+[patch.crates-io]
+ruststep = { git = "https://github.com/stefangolas/ruststep", rev = "67f1f7c" }
+truck-assembly = { path = "third_party/look/vendor/truck/truck-assembly" }
+truck-base = { path = "third_party/look/vendor/truck/truck-base" }
+truck-derivers = { path = "third_party/look/vendor/truck/truck-derivers" }
+truck-geometry = { path = "third_party/look/vendor/truck/truck-geometry" }
+truck-geotrait = { path = "third_party/look/vendor/truck/truck-geotrait" }
+truck-meshalgo = { path = "third_party/look/vendor/truck/truck-meshalgo" }
+truck-modeling = { path = "third_party/look/vendor/truck/truck-modeling" }
+truck-polymesh = { path = "third_party/look/vendor/truck/truck-polymesh" }
+truck-stepio = { path = "third_party/look/vendor/truck/truck-stepio" }
+truck-topology = { path = "third_party/look/vendor/truck/truck-topology" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "unwind"

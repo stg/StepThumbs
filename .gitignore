@@ -1,0 +1,7 @@
+target/
+publish/
+dist/
+*.exe
+*.dll
+*.pdb
+*.log
