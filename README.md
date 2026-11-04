@@ -3,25 +3,26 @@
 Fast 3D thumbnails for Windows Explorer, ready before you need them.
 
 I've used F3D for a long time and truly appreciate it, but the time has come for
-an upgrade. StepThumbs renders changed models quietly in the
-background and keeps its own cache, so Windows clearing its thumbnails doesn't
-mean starting over.
+an upgrade.
 
 ![STEP thumbnails](assets/thumbnails.png)
 
-On my 6.7 MB STEP assembly, the modified Look renderer took about a second,
-against 5–6 seconds with F3D. A cached thumbnail returned in 16 ms.
-
-After the first scan, it watches for changes and renders changed files at low
-priority. Explorer checks the disk cache first; a miss gets foreground priority.
-The Rust tray app keeps RAM use low, sleeps when there's no work, and releases
-its GPU resources. No service or periodic rescans, and no CPU/GPU work while idle.
-
-It supports **STEP, STP, STL and GLB**, with source colours, edges, ambient
-occlusion and transparent or coloured backgrounds. The quiet **3D** tray icon
-opens activity, cache usage and settings for folders, file types and rendering.
-Limit model size and background workers to keep larger jobs under control.
-Rendering settings include a live preview; use the supplied model or load your own.
+- **About 5× faster on the tested assembly.** My 6.7 MB STEP assembly took about
+  a second with the modified Look renderer, against 5–6 seconds with F3D.
+  A cached thumbnail returned in 16 ms.
+- **Preflight means previews are ready before you browse.** After the first scan,
+  it watches for changed models and renders them at low priority; an Explorer
+  cache miss gets foreground priority.
+- **Windows clearing its cache doesn't mean starting over.** StepThumbs keeps
+  its own disk cache, which Explorer's thumbnail provider checks first.
+- **Low RAM, no CPU/GPU work while idle.** About 31 MiB of idle RAM in local
+  tests, with the app sleeping between jobs and releasing GPU resources.
+  No Windows service or periodic rescans.
+- **STEP, STP, STL and GLB.** Render with source colours, edges, ambient occlusion
+  and transparent or coloured backgrounds; try changes in the live preview
+  using the supplied model or your own.
+- **A quiet 3D tray icon.** Open activity, cache usage and settings from the tray,
+  choose folders and file types, and cap model size and background workers.
 
 ## Install
 
