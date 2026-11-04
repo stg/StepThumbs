@@ -1,6 +1,8 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 use crate::{Broker, Config, common};
+mod forms;
 mod layout;
+use forms::*;
 use std::{
     ptr::{null, null_mut},
     sync::{
@@ -11,8 +13,15 @@ use std::{
 use windows_sys::Win32::{
     Foundation::*,
     Graphics::Gdi::*,
-    System::LibraryLoader::GetModuleHandleW,
-    UI::{Shell::*, WindowsAndMessaging::*},
+    System::{
+        LibraryLoader::GetModuleHandleW,
+        SystemServices::{SS_OWNERDRAW, SS_PATHELLIPSIS},
+    },
+    UI::{
+        Input::KeyboardAndMouse::{EnableWindow, IsWindowEnabled},
+        Shell::*,
+        WindowsAndMessaging::*,
+    },
 };
 static BROKER: OnceLock<Arc<Broker>> = OnceLock::new();
 static WINDOW: AtomicIsize = AtomicIsize::new(0);
@@ -27,6 +36,15 @@ const TRAY: u32 = WM_APP + 1;
 const UPDATE: u32 = WM_APP + 2;
 const SHOW: u32 = WM_APP + 3;
 const QUIT: u32 = WM_APP + 4;
+const PREVIEW_READY: u32 = WM_APP + 5;
+pub fn preview_ready() {
+    let hwnd = WINDOW.load(Ordering::Acquire) as HWND;
+    if !hwnd.is_null() {
+        unsafe {
+            PostMessageW(hwnd, PREVIEW_READY, 0, 0);
+        }
+    }
+}
 fn restart(page: usize) {
     let broker = BROKER.get().unwrap().clone();
     std::thread::spawn(move || {
@@ -95,7 +113,10 @@ unsafe fn control(
         WS_CHILD
             | WS_VISIBLE
             | style
-            | if kind == "BUTTON" || kind == "EDIT" {
+            | if matches!(
+                kind,
+                "BUTTON" | "EDIT" | "COMBOBOX" | "LISTBOX" | "SysTabControl32"
+            ) {
                 WS_TABSTOP
             } else {
                 0
@@ -136,7 +157,8 @@ struct Controls {
     recent: HWND,
     roots: HWND,
     exclude: HWND,
-    settle: HWND,
+    tabs: HWND,
+    remove_paths: [HWND; 2],
     limit: HWND,
     workers: HWND,
     max_file: HWND,
@@ -144,6 +166,14 @@ struct Controls {
     hooks: [HWND; 4],
     render_fields: Vec<HWND>,
     render_checks: Vec<HWND>,
+    render_labels: Vec<HWND>,
+    render_hint: HWND,
+    preview_box: HWND,
+    preview_status: HWND,
+    preview: crate::preview::Preview,
+    preview_path: Option<std::path::PathBuf>,
+    preview_revision: u64,
+    preview_pixels: Option<Vec<u8>>,
     icon: HICON,
     task_icon: HICON,
 }
@@ -157,34 +187,168 @@ unsafe fn page(index: usize) {
             ShowWindow(*h, if i == index { SW_SHOW } else { SW_HIDE });
         }
     }
+    SendMessageW(
+        (*STATE).tabs,
+        windows_sys::Win32::UI::Controls::TCM_SETCURSEL,
+        index,
+        0,
+    );
+    let hwnd = GetParent((*STATE).tabs);
+    if index == 3 {
+        schedule_preview(hwnd);
+    } else {
+        release_preview(hwnd);
+    }
+}
+unsafe fn schedule_preview(hwnd: HWND) {
+    if !STATE.is_null() && IsWindowVisible((*STATE).preview_box) != 0 {
+        SetTimer(hwnd, 1, 200, None);
+    }
+}
+unsafe fn release_preview(hwnd: HWND) {
+    KillTimer(hwnd, 1);
+    if !STATE.is_null() {
+        (*STATE).preview.release();
+        (*STATE).preview_revision = 0;
+        (*STATE).preview_pixels = None;
+    }
+}
+unsafe fn begin_preview() {
+    let config = render_config();
+    let s = &mut *STATE;
+    match config {
+        Ok(cfg) => {
+            let path = s
+                .preview_path
+                .clone()
+                .unwrap_or_else(crate::preview::default_path);
+            settext(s.preview_status, "Updating preview…");
+            s.preview_revision = s.preview.request(path, cfg);
+        }
+        Err(_) => {
+            s.preview.invalidate();
+            s.preview_revision = 0;
+            settext(
+                s.preview_status,
+                "Enter valid values to update the preview.",
+            );
+        }
+    }
+}
+unsafe fn accept_preview() {
+    let s = &mut *STATE;
+    if let Some(reply) = s.preview.take() {
+        if reply.revision != s.preview_revision {
+            return;
+        }
+        match reply.result {
+            Ok(image) => {
+                // Composite transparent pixels onto a subtle checkerboard for display.
+                let mut pixels = Vec::with_capacity(512 * 512 * 4);
+                for (x, y, pixel) in image.enumerate_pixels() {
+                    let bg = if (x / 20 + y / 20) % 2 == 0 {
+                        255u32
+                    } else {
+                        240u32
+                    };
+                    let a = pixel[3] as u32;
+                    for c in [2, 1, 0] {
+                        pixels.push(((pixel[c] as u32 * a + bg * (255 - a) + 127) / 255) as u8);
+                    }
+                    pixels.push(255);
+                }
+                s.preview_pixels = Some(pixels);
+                settext(
+                    s.preview_status,
+                    s.preview_path
+                        .as_ref()
+                        .and_then(|p| p.file_name())
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("Default preview"),
+                );
+            }
+            Err(error) => {
+                s.preview_pixels = None;
+                settext(s.preview_status, &error);
+            }
+        }
+        InvalidateRect(s.preview_box, null(), 0);
+    }
+}
+unsafe fn draw_preview(draw: &windows_sys::Win32::UI::Controls::DRAWITEMSTRUCT) {
+    let mut r = draw.rcItem;
+    FillRect(draw.hDC, &r, GetSysColorBrush(COLOR_WINDOW));
+    FrameRect(draw.hDC, &r, GetSysColorBrush(COLOR_3DSHADOW));
+    if STATE.is_null() {
+        return;
+    }
+    if let Some(pixels) = &(*STATE).preview_pixels {
+        r.left += 1;
+        r.top += 1;
+        r.right -= 1;
+        r.bottom -= 1;
+        let side = (r.right - r.left).min(r.bottom - r.top);
+        let x = r.left + (r.right - r.left - side) / 2;
+        let y = r.top + (r.bottom - r.top - side) / 2;
+        let mut info: BITMAPINFO = std::mem::zeroed();
+        info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        info.bmiHeader.biWidth = 512;
+        info.bmiHeader.biHeight = -512;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        SetStretchBltMode(draw.hDC, HALFTONE);
+        SetBrushOrgEx(draw.hDC, 0, 0, null_mut());
+        StretchDIBits(
+            draw.hDC,
+            x,
+            y,
+            side,
+            side,
+            0,
+            0,
+            512,
+            512,
+            pixels.as_ptr() as _,
+            &info,
+            DIB_RGB_COLORS,
+            SRCCOPY,
+        );
+    }
 }
 unsafe fn status() {
     if !STATE.is_null() {
         let s = BROKER.get().unwrap().status();
         let cache = if s["cache_ready"].as_bool().unwrap_or(false) {
             format!(
-                "Cache: {} images, {:.1} / {} MiB",
+                "Cache: {} images, {:.1} MiB / {}",
                 s["cache_files"],
                 s["cache_bytes"].as_u64().unwrap_or(0) as f64 / 1048576.0,
-                s["cache_limit_mb"]
+                if s["cache_limit_mb"].as_u64() == Some(0) {
+                    "unlimited".to_string()
+                } else {
+                    format!("{} MiB", s["cache_limit_mb"])
+                }
             )
         } else {
             "Cache: counting existing thumbnails".to_owned()
         };
         let text = format!(
-            "Preflight: {}     GPU: {}\r\nQueued: {}  (preflight {})\r\nRendered: {}     Failures: {}     Cache hits: {}\r\n{}\r\nModel bytes this session: {:.1} MiB\r\nProcess memory: {:.1} MiB     CPU time: {:.1} s",
+            "Preflight: {}     GPU: {}\r\nQueued: {}  (preflight {})     Deferred: {}\r\nRendered: {}     Failures: {}     Cache hits: {}\r\n{}\r\nModel bytes this session: {:.1} MiB\r\nProcess memory: {:.1} MiB     CPU time: {:.1} s",
             if s["paused"].as_bool().unwrap_or(false) {
                 "Paused"
             } else if s["scanning"].is_string() {
                 "Scanning"
             } else if s["queued"].as_u64().unwrap_or(0) > 0 {
                 "Preparing"
+            } else if s["preflight_pending"].as_u64().unwrap_or(0) > 0 {
+                "Waiting to retry"
             } else {
                 "Idle"
             },
             s["gpu"].as_str().unwrap_or("unknown"),
             s["queued"],
             s["preflight_pending"],
+            s["preflight_failed"],
             s["success"],
             s["failures"],
             s["cache_hits"],
@@ -277,7 +441,7 @@ unsafe fn notify(hwnd: HWND, action: u32, ico: HICON) {
     Shell_NotifyIconW(action, &n);
 }
 unsafe fn button(hwnd: HWND, text: &str, x: i32, y: i32, w: i32, id: usize) -> HWND {
-    control(hwnd, "BUTTON", text, 0, x, y, w, 27, id)
+    control(hwnd, "BUTTON", text, 0, x, y, w, 24, id)
 }
 unsafe extern "system" fn window(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -313,345 +477,59 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
             );
             FONT = layout::font();
             let cfg = Config::load().unwrap_or_default();
-            let mut pages: [Vec<HWND>; 4] = Default::default();
-            for (i, name) in ["Activity", "Settings", "File types", "Rendering"]
-                .iter()
-                .enumerate()
-            {
-                button(hwnd, name, 12 + i as i32 * 130, 10, 120, 10 + i);
-            }
-            let labels = control(hwnd, "STATIC", "", 0, 20, 55, 628, 115, 0);
-            pages[0].push(labels);
-            pages[0].push(control(
-                hwnd,
-                "STATIC",
-                "Recent activity",
-                0,
-                20,
-                177,
-                628,
-                18,
-                0,
-            ));
-            let recent = control(
-                hwnd,
-                "EDIT",
-                "",
-                WS_BORDER
-                    | ES_MULTILINE as u32
-                    | ES_READONLY as u32
-                    | ES_AUTOHSCROLL as u32
-                    | WS_HSCROLL
-                    | WS_VSCROLL,
-                20,
-                200,
-                628,
-                158,
-                0,
-            );
-            pages[0].push(recent);
-            pages[0].push(button(hwnd, "Open cache folder", 20, 373, 160, 105));
-            let mut add = |page: usize, h: HWND| {
-                pages[page].push(h);
-                h
-            };
-            add(
-                1,
-                control(hwnd, "STATIC", "Roots, one per line", 0, 20, 55, 300, 20, 0),
-            );
-            let roots = add(
-                1,
-                control(
-                    hwnd,
-                    "EDIT",
-                    &cfg.roots.join("\r\n"),
-                    WS_BORDER | (ES_MULTILINE as u32) | WS_VSCROLL,
-                    20,
-                    78,
-                    300,
-                    105,
-                    0,
-                ),
-            );
-            add(
-                1,
-                control(
-                    hwnd,
-                    "STATIC",
-                    "Excluded paths, one per line",
-                    0,
-                    340,
-                    55,
-                    300,
-                    20,
-                    0,
-                ),
-            );
-            let exclude = add(
-                1,
-                control(
-                    hwnd,
-                    "EDIT",
-                    &cfg.exclude.join("\r\n"),
-                    WS_BORDER | (ES_MULTILINE as u32) | WS_VSCROLL,
-                    340,
-                    78,
-                    300,
-                    105,
-                    0,
-                ),
-            );
-            add(
-                1,
-                control(hwnd, "STATIC", "Settle seconds", 0, 20, 229, 120, 20, 0),
-            );
-            let settle = add(
-                1,
-                control(
-                    hwnd,
-                    "EDIT",
-                    &cfg.settle_seconds.to_string(),
-                    WS_BORDER,
-                    145,
-                    225,
-                    80,
-                    24,
-                    0,
-                ),
-            );
-            add(
-                1,
-                control(hwnd, "STATIC", "Cache limit MiB", 0, 340, 229, 155, 20, 0),
-            );
-            let limit = add(
-                1,
-                control(
-                    hwnd,
-                    "EDIT",
-                    &cfg.max_cache_mb.to_string(),
-                    WS_BORDER,
-                    500,
-                    225,
-                    140,
-                    24,
-                    0,
-                ),
-            );
-            let workers = add(
-                1,
-                control(
-                    hwnd,
-                    "EDIT",
-                    &cfg.background_workers.to_string(),
-                    WS_BORDER | ES_NUMBER as u32,
-                    145,
-                    265,
-                    80,
-                    24,
-                    0,
-                ),
-            );
-            add(
-                1,
-                control(hwnd, "STATIC", "Background workers", 0, 20, 269, 125, 20, 0),
-            );
-            let max_file = add(
-                1,
-                control(
-                    hwnd,
-                    "EDIT",
-                    &cfg.max_file_mb.to_string(),
-                    WS_BORDER | ES_NUMBER as u32,
-                    500,
-                    265,
-                    140,
-                    24,
-                    0,
-                ),
-            );
-            add(
-                1,
-                control(
-                    hwnd,
-                    "STATIC",
-                    "Max model size MiB",
-                    0,
-                    340,
-                    269,
-                    155,
-                    20,
-                    0,
-                ),
-            );
-            add(
-                1,
-                control(
-                    hwnd,
-                    "STATIC",
-                    "Size 0 = unlimited. More workers use more RAM while preparing models.",
-                    0,
-                    20,
-                    302,
-                    628,
-                    20,
-                    0,
-                ),
-            );
-            add(
-                1,
-                control(
-                    hwnd,
-                    "STATIC",
-                    "Exclusions only affect preflighting; requested thumbnails still render.",
-                    0,
-                    20,
-                    191,
-                    628,
-                    20,
-                    0,
-                ),
-            );
-            let startup = add(
-                1,
-                control(
-                    hwnd,
-                    "BUTTON",
-                    "Start with Windows",
-                    BS_AUTOCHECKBOX as u32,
-                    20,
-                    335,
-                    250,
-                    25,
-                    0,
-                ),
-            );
-            checked(startup, common::hooks::startup_enabled());
-            add(1, button(hwnd, "Save settings", 20, 372, 150, 40));
-            let mut hooks = [null_mut(); 4];
-            for (i, ext) in common::hooks::EXTENSIONS.iter().enumerate() {
-                let st = common::hooks::status(ext);
-                hooks[i] = add(
-                    2,
-                    control(
-                        hwnd,
-                        "BUTTON",
-                        &format!("{}    {}", ext, st.provider),
-                        BS_AUTOCHECKBOX as u32,
-                        20,
-                        60 + i as i32 * 36,
-                        600,
-                        27,
-                        0,
-                    ),
-                );
-                let fresh = !common::data_dir()
-                    .join("previous-associations.json")
-                    .exists();
-                checked(hooks[i], st.ours || (fresh && i < 2));
-            }
-            add(
-                2,
-                button(hwnd, "Install selected preview hooks", 20, 220, 235, 41),
-            );
-            let values = [
-                ("Renderer (look/f3d)", cfg.renderer.clone()),
-                ("Background colour", cfg.background.clone()),
-                ("AO strength", cfg.ao_strength.to_string()),
-                ("AO radius", cfg.ao_radius.to_string()),
-                ("Edge darkness", cfg.edge_strength.to_string()),
-                ("Edge width", cfg.edge_width.to_string()),
-                ("Ambient brightness", cfg.ambient.to_string()),
-                ("Light intensity", cfg.light_intensity.to_string()),
-                ("Light direction", cfg.light_direction.clone()),
-                ("Light colour", cfg.light_colour.clone()),
-                ("Lighting preset", cfg.lighting_preset.clone()),
-            ];
-            let mut render_fields = Vec::new();
-            for (i, (name, value)) in values.iter().enumerate() {
-                let x = 20 + (i / 6) as i32 * 320;
-                let y = 58 + (i % 6) as i32 * 38;
-                add(3, control(hwnd, "STATIC", name, 0, x, y + 4, 155, 22, 0));
-                render_fields.push(add(
-                    3,
-                    control(hwnd, "EDIT", value, WS_BORDER, x + 158, y, 140, 24, 0),
-                ));
-            }
-            let mut render_checks = Vec::new();
-            for (i, (name, value)) in [
-                ("Transparent", cfg.transparent),
-                ("Source colours", cfg.source_colours),
-                ("Antialias", cfg.antialias),
-                ("Ambient occlusion", cfg.ambient_occlusion),
-                ("Edges", cfg.edges),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let x = 20 + (i % 3) as i32 * 210;
-                let y = 300 + (i / 3) as i32 * 28;
-                let h = add(
-                    3,
-                    control(
-                        hwnd,
-                        "BUTTON",
-                        name,
-                        BS_AUTOCHECKBOX as u32,
-                        x,
-                        y,
-                        200,
-                        24,
-                        0,
-                    ),
-                );
-                checked(h, value);
-                render_checks.push(h);
-            }
-            add(3, button(hwnd, "Save rendering settings", 20, 360, 200, 42));
-            add(
-                3,
-                control(
-                    hwnd,
-                    "STATIC",
-                    "F3D uses background, source colours and antialiasing.",
-                    0,
-                    235,
-                    366,
-                    405,
-                    22,
-                    0,
-                ),
-            );
-            let ico = tray_icon(hwnd);
-            let task_icon = icon(include_bytes!("../assets/app.ico"), 32);
-            SendMessageW(hwnd, WM_SETICON, 1, task_icon as isize);
-            SendMessageW(hwnd, WM_SETICON, 0, task_icon as isize);
-            STATE = Box::into_raw(Box::new(Controls {
-                pages,
-                labels,
-                recent,
-                roots,
-                exclude,
-                settle,
-                limit,
-                workers,
-                max_file,
-                startup,
-                hooks,
-                render_fields,
-                render_checks,
-                icon: ico,
-                task_icon,
-            }));
+            STATE = Box::into_raw(Box::new(forms::build(hwnd, &cfg)));
+            enable_rendering();
             if !SNAPSHOT.load(Ordering::Relaxed) {
-                notify(hwnd, NIM_ADD, ico);
+                notify(hwnd, NIM_ADD, (*STATE).icon);
             }
             page(INITIAL_PAGE.load(Ordering::Relaxed));
             status();
             0
         }
         WM_COMMAND => {
+            if STATE.is_null() {
+                return 0;
+            }
             let id = (wp & 0xffff) as usize;
+            let notification = (wp >> 16) as u32;
             match id {
+                200..=210 | 230..=234 if notification == EN_CHANGE || notification == CBN_SELCHANGE || notification == BN_CLICKED => {
+                    enable_rendering();
+                    schedule_preview(hwnd);
+                }
+                50..=51 => {
+                    let s=&*STATE;
+                    let list=if id==50 {s.roots}else{s.exclude};
+                    EnableWindow(s.remove_paths[id-50], (SendMessageW(list,LB_GETCURSEL,0,0)>=0) as i32);
+                }
+                52 | 54 => {
+                    match pick(hwnd,true) {
+                        Ok(Some(path)) => list_add(if id==52 {(*STATE).roots}else{(*STATE).exclude},&path),
+                        Ok(None) => {},
+                        Err(e) => { MessageBoxW(hwnd, common::wide(common::brief_error(&e)).as_ptr(),common::wide("Choose folder").as_ptr(),MB_OK|MB_ICONERROR); }
+                    }
+                }
+                53 | 55 => {
+                    let list=if id==53 {(*STATE).roots}else{(*STATE).exclude};
+                    let index=SendMessageW(list,LB_GETCURSEL,0,0);
+                    if index>=0 { SendMessageW(list,LB_DELETESTRING,index as usize,0); }
+                    EnableWindow((*STATE).remove_paths[(id-53)/2],0);
+                }
+                81 => {
+                    match pick(hwnd,false) {
+                        Ok(Some(path)) => { (*STATE).preview_path=Some(path.into()); schedule_preview(hwnd); }
+                        Ok(None) => {},
+                        Err(e) => { MessageBoxW(hwnd,common::wide(common::brief_error(&e)).as_ptr(),common::wide("Load preview file").as_ptr(),MB_OK|MB_ICONERROR); }
+                    }
+                }
+                82 => { (*STATE).preview_path=None; schedule_preview(hwnd); }
+                106 => crate::monitor::rescan(),
+                107 => crate::monitor::retry_failed(),
+                108 => {
+                    if MessageBoxW(hwnd,common::wide("Delete StepThumbs’ cached thumbnails?\r\n\r\nThey will be rendered again when requested or on the next rescan.").as_ptr(),common::wide("Clear thumbnail cache").as_ptr(),MB_YESNO|MB_ICONWARNING|MB_DEFBUTTON2)==IDYES {
+                        std::thread::spawn(|| { if let Err(e)=crate::cache_index::clear_images(){crate::cache_index::log(&e);} update(); });
+                    }
+                }
                 10..=13 => {
                     page(id - 10);
                     status();
@@ -660,17 +538,8 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
                     let s = &*STATE;
                     let result = (|| -> anyhow::Result<()> {
                         let mut cfg = Config::load()?;
-                        cfg.roots = get(s.roots)
-                            .lines()
-                            .map(|v| v.trim().to_string())
-                            .filter(|v| !v.is_empty())
-                            .collect();
-                        cfg.exclude = get(s.exclude)
-                            .lines()
-                            .map(|v| v.trim().to_string())
-                            .filter(|v| !v.is_empty())
-                            .collect();
-                        cfg.settle_seconds = get(s.settle).parse()?;
+                        cfg.roots = list_values(s.roots);
+                        cfg.exclude = list_values(s.exclude);
                         cfg.max_cache_mb = get(s.limit).parse()?;
                         cfg.background_workers = get(s.workers).parse()?;
                         cfg.max_file_mb = get(s.max_file).parse()?;
@@ -739,30 +608,7 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
                     }
                 }
                 42 => {
-                    let s = &*STATE;
-                    let result = (|| -> anyhow::Result<()> {
-                        let mut cfg = Config::load()?;
-                        let f = &s.render_fields;
-                        let c = &s.render_checks;
-                        cfg.renderer = get(f[0]).trim().to_lowercase();
-                        cfg.background = get(f[1]);
-                        cfg.ao_strength = get(f[2]).parse()?;
-                        cfg.ao_radius = get(f[3]).parse()?;
-                        cfg.edge_strength = get(f[4]).parse()?;
-                        cfg.edge_width = get(f[5]).parse()?;
-                        cfg.ambient = get(f[6]).parse()?;
-                        cfg.light_intensity = get(f[7]).parse()?;
-                        cfg.light_direction = get(f[8]);
-                        cfg.light_colour = get(f[9]);
-                        cfg.lighting_preset = get(f[10]);
-                        cfg.transparent = check(c[0]);
-                        cfg.source_colours = check(c[1]);
-                        cfg.antialias = check(c[2]);
-                        cfg.ambient_occlusion = check(c[3]);
-                        cfg.edges = check(c[4]);
-                        cfg.save()?;
-                        Ok(())
-                    })();
+                    let result = render_config().and_then(|cfg| cfg.save());
                     if let Err(e) = result {
                         MessageBoxW(
                             hwnd,
@@ -825,9 +671,32 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
             }
             0
         }
+        WM_NOTIFY => {
+            use windows_sys::Win32::UI::Controls::*;
+            let notification = &*(lp as *const NMHDR);
+            if notification.idFrom == 9 && notification.code == TCN_SELCHANGE {
+                page(SendMessageW((*STATE).tabs, TCM_GETCURSEL, 0, 0) as usize);
+                status();
+            }
+            0
+        }
+        WM_DRAWITEM if wp == 80 => {
+            draw_preview(&*(lp as *const windows_sys::Win32::UI::Controls::DRAWITEMSTRUCT));
+            1
+        }
+        WM_TIMER if wp == 1 => {
+            KillTimer(hwnd, 1);
+            begin_preview();
+            0
+        }
+        PREVIEW_READY => {
+            accept_preview();
+            0
+        }
         TRAY => {
             if lp as u32 == WM_LBUTTONUP {
                 layout::show(hwnd);
+                schedule_preview(hwnd);
                 status();
             } else if lp as u32 == WM_RBUTTONUP {
                 let menu = CreatePopupMenu();
@@ -872,6 +741,11 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
             let old_font = FONT;
             FONT = layout::font();
             layout::change_dpi(layout::dpi(), FONT);
+            if !STATE.is_null() {
+                tab_size((*STATE).tabs);
+                list_extent((*STATE).roots);
+                list_extent((*STATE).exclude);
+            }
             if !old_font.is_null() {
                 DeleteObject(old_font);
             }
@@ -907,7 +781,14 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
         }
         WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
             SetBkMode(wp as HDC, TRANSPARENT as i32);
-            SetTextColor(wp as HDC, GetSysColor(COLOR_BTNTEXT));
+            SetTextColor(
+                wp as HDC,
+                GetSysColor(if IsWindowEnabled(lp as HWND) != 0 {
+                    COLOR_BTNTEXT
+                } else {
+                    COLOR_GRAYTEXT
+                }),
+            );
             SetBkColor(wp as HDC, GetSysColor(COLOR_BTNFACE));
             GetSysColorBrush(COLOR_BTNFACE) as LRESULT
         }
@@ -926,6 +807,7 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
         }
         SHOW => {
             layout::show(hwnd);
+            schedule_preview(hwnd);
             status();
             0
         }
@@ -940,6 +822,7 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
             if !SNAPSHOT.load(Ordering::Relaxed) {
                 layout::save(hwnd);
             }
+            release_preview(hwnd);
             ShowWindow(hwnd, SW_HIDE);
             0
         }
@@ -1011,11 +894,14 @@ pub fn run(broker: Arc<Broker>, visible: bool, initial_page: usize) -> anyhow::R
             PostMessageW(hwnd, QUIT, 0, 0);
         } else if visible {
             layout::show(hwnd);
+            schedule_preview(hwnd);
         }
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            if IsDialogMessageW(hwnd, &msg) == 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
         }
         WINDOW.store(0, Ordering::Release);
     }
@@ -1066,6 +952,7 @@ pub fn snapshot(
         if hwnd.is_null() {
             return Err(std::io::Error::last_os_error().into());
         }
+        WINDOW.store(hwnd as isize, Ordering::Release);
         let (width, height) = layout::size(WS_EX_TOOLWINDOW);
         SetWindowPos(
             hwnd,
@@ -1097,6 +984,21 @@ pub fn snapshot(
         let pages = if filetypes_only { 2..3 } else { 0..4 };
         for i in pages {
             page(i);
+            if i == 3 {
+                KillTimer(hwnd, 1);
+                begin_preview();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(35);
+                while std::time::Instant::now() < deadline
+                    && get((*STATE).preview_status).starts_with("Updating preview")
+                {
+                    let mut message: MSG = std::mem::zeroed();
+                    while PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                        TranslateMessage(&message);
+                        DispatchMessageW(&message);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
             InvalidateRect(hwnd, null(), 1);
             UpdateWindow(hwnd);
             if windows_sys::Win32::Storage::Xps::PrintWindow(hwnd, dc, 0) == 0 {

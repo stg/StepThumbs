@@ -11,7 +11,6 @@ pub struct Config {
     pub roots: Vec<String>,
     pub exclude: Vec<String>,
     pub extensions: Vec<String>,
-    pub settle_seconds: u64,
     #[serde(rename = "MaxCacheMB")]
     pub max_cache_mb: u64,
     pub background_workers: usize,
@@ -52,7 +51,6 @@ impl Default for Config {
             roots,
             exclude,
             extensions: vec![".step".into(), ".stp".into()],
-            settle_seconds: 3,
             max_cache_mb: 2048,
             background_workers: 1,
             max_file_mb: 0,
@@ -141,8 +139,7 @@ impl Config {
         if direction == [0.0; 3] {
             bail!("Light direction must be non-zero.")
         }
-        if self.settle_seconds > 60
-            || !self.ao_strength.is_finite()
+        if !self.ao_strength.is_finite()
             || !(0.0..=3.0).contains(&self.ao_strength)
             || !(1.0..=100.0).contains(&self.ao_radius)
             || !(0.0..=1.0).contains(&self.edge_strength)
@@ -150,7 +147,7 @@ impl Config {
             || !(0.0..=2.0).contains(&self.ambient)
             || !(0.0..=10.0).contains(&self.light_intensity)
         {
-            bail!("Check delay, lighting, edge and AO values.")
+            bail!("Check lighting, edge and AO values.")
         }
         Ok(())
     }

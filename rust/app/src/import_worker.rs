@@ -24,6 +24,10 @@ use std::{
 use windows_sys::Win32::{Foundation::*, System::JobObjects::*};
 const MAX_FRAME: u64 = 512 * 1024 * 1024;
 static PROCESSES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static STARTED: AtomicU64 = AtomicU64::new(0);
+pub fn started() -> u64 {
+    STARTED.load(Ordering::Relaxed)
+}
 static FINISHED_CPU: AtomicU64 = AtomicU64::new(0);
 pub fn metrics() -> (u64, f64) {
     let processes = PROCESSES.lock().unwrap();
@@ -157,6 +161,7 @@ impl Importer {
             .unwrap()
             .push(process.child.as_raw_handle() as usize);
         process.registered = true;
+        STARTED.fetch_add(1, Ordering::Relaxed);
         crate::ui::update();
         Ok(Self {
             process,
@@ -185,7 +190,8 @@ impl Importer {
             let deadline = Instant::now() + Duration::from_secs(request.seconds);
             let mut last_update = Instant::now();
             loop {
-                if state.quiescing.load(Ordering::Acquire) {
+                if state.quiescing.load(Ordering::Acquire) || job.cancelled.load(Ordering::Acquire)
+                {
                     bail!("Import cancelled for shutdown")
                 }
                 let remaining = deadline.saturating_duration_since(Instant::now());

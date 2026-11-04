@@ -55,6 +55,7 @@ impl Index {
             CREATE TABLE IF NOT EXISTS cached_files(cache_key TEXT PRIMARY KEY, bytes INTEGER NOT NULL, modified INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS cache_age ON cached_files(modified);
             CREATE TABLE IF NOT EXISTS failures(cache_key TEXT PRIMARY KEY, error TEXT NOT NULL);")?;
+        db.execute_batch("CREATE TABLE IF NOT EXISTS failure_sources(cache_key TEXT PRIMARY KEY, path TEXT NOT NULL);")?;
         let directories = {
             let mut stmt = db.prepare("SELECT DISTINCT parent_key FROM parents")?;
             stmt.query_map([], |r| r.get(0))?
@@ -388,12 +389,49 @@ pub fn failed(key: &str) -> Result<Option<String>> {
         )
         .optional()?)
 }
-pub fn mark_failed(key: &str, error: &str) -> Result<()> {
+pub fn mark_failed(key: &str, path: &Path, error: &str) -> Result<()> {
     let key = format!("{}:{key}", env!("CARGO_PKG_VERSION"));
-    index()?.lock().unwrap().db.execute(
+    let mut index = index()?.lock().unwrap();
+    let tx = index.db.transaction()?;
+    tx.execute(
         "INSERT OR REPLACE INTO failures VALUES(?1,?2)",
-        params![key, error],
+        params![&key, error],
     )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO failure_sources VALUES(?1,?2)",
+        params![&key, path.to_string_lossy()],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+pub fn retry_failures() -> Result<Vec<PathBuf>> {
+    let mut index = index()?.lock().unwrap();
+    let paths = {
+        let mut stmt = index
+            .db
+            .prepare("SELECT DISTINCT path FROM failure_sources")?;
+        stmt.query_map([], |r| Ok(PathBuf::from(r.get::<_, String>(0)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let tx = index.db.transaction()?;
+    tx.execute("DELETE FROM failures", [])?;
+    tx.execute("DELETE FROM failure_sources", [])?;
+    tx.commit()?;
+    Ok(paths)
+}
+pub fn clear_images() -> Result<()> {
+    let mut index = index()?.lock().unwrap();
+    // Explicit maintenance uses the index, never a recursive folder traversal.
+    let keys = {
+        let mut stmt = index.db.prepare("SELECT cache_key FROM cached_files")?;
+        stmt.query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for key in keys {
+        index.remove_image(&key)?;
+    }
+    index.db.execute("DELETE FROM sources", [])?;
+    index.directories.clear();
     Ok(())
 }
 pub fn log(error: &anyhow::Error) {

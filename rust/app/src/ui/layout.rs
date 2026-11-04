@@ -11,8 +11,8 @@ use windows_sys::Win32::{
 };
 
 pub const STYLE: u32 = WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-pub const WIDTH: i32 = 668;
-pub const HEIGHT: i32 = 410;
+pub const WIDTH: i32 = 646;
+pub const HEIGHT: i32 = 369;
 thread_local! {
     static DPI: Cell<u32> = const { Cell::new(96) };
     static CONTROLS: RefCell<Vec<(HWND,[i32;4])>> = const { RefCell::new(Vec::new()) };
@@ -229,6 +229,11 @@ pub unsafe fn show(hwnd: HWND) {
                 SW_SHOW
             },
         );
+        // The first ShowWindow call can inherit SW_HIDE from a quiet launcher.
+        // Consume that startup override before presenting an explicitly requested UI.
+        if IsWindowVisible(hwnd) == 0 {
+            ShowWindow(hwnd, SW_SHOW);
+        }
         SetForegroundWindow(hwnd);
     }
 }

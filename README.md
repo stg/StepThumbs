@@ -15,12 +15,13 @@ against 5–6 seconds with F3D. A cached thumbnail returned in 16 ms.
 After the first scan, it watches for changes and renders changed files at low
 priority. Explorer checks the disk cache first; a miss gets foreground priority.
 The Rust tray app keeps RAM use low, sleeps when there's no work, and releases
-its GPU resources. No service, no polling, and no CPU/GPU work while idle.
+its GPU resources. No service or periodic rescans, and no CPU/GPU work while idle.
 
 It supports **STEP, STP, STL and GLB**, with source colours, edges, ambient
 occlusion and transparent or coloured backgrounds. The quiet **3D** tray icon
 opens activity, cache usage and settings for folders, file types and rendering.
 Limit model size and background workers to keep larger jobs under control.
+Rendering settings include a live preview; use the supplied model or load your own.
 
 ## Install
 

@@ -26,17 +26,20 @@ struct Checkpoint {
     renderer_profile: String,
     known_files: Vec<String>,
     max_file_mb: Option<u64>,
+    failed_files: Vec<String>,
 }
 enum Event {
     File(PathBuf, bool),
     Directory(PathBuf),
     Deleted(PathBuf),
     Scanned(PathBuf),
-    Finished(PathBuf, bool),
+    Finished(PathBuf, bool, bool),
     Journal(String),
     Overflow(String),
     Wake,
     Track(PathBuf),
+    Rescan,
+    RetryFailed,
     Shutdown(mpsc::SyncSender<()>),
 }
 fn signature(cfg: &Config, extensions: bool) -> String {
@@ -248,6 +251,7 @@ fn save(
     files: &HashMap<PathBuf, (Instant, u32)>,
     dirs: &HashSet<PathBuf>,
     known: &HashSet<PathBuf>,
+    failed: &HashSet<PathBuf>,
 ) -> anyhow::Result<()> {
     let c = Checkpoint {
         version: 2,
@@ -258,6 +262,7 @@ fn save(
         renderer_profile: cfg.profile(),
         known_files: known.iter().map(|p| p.to_string_lossy().into()).collect(),
         max_file_mb: Some(cfg.max_file_mb),
+        failed_files: failed.iter().map(|p| p.to_string_lossy().into()).collect(),
     };
     common::cache::atomic_write(
         &common::data_dir().join("checkpoint-v2.json"),
@@ -276,6 +281,40 @@ pub fn shutdown() {
 pub fn wake() {
     if let Some(tx) = NOTIFY.get() {
         let _ = tx.send(Event::Wake);
+    }
+}
+pub fn rescan() {
+    if let Some(tx) = NOTIFY.get() {
+        let _ = tx.try_send(Event::Rescan);
+    }
+}
+pub fn retry_failed() {
+    if let Some(tx) = NOTIFY.get() {
+        let _ = tx.try_send(Event::RetryFailed);
+    }
+}
+fn writer_open(path: &Path) -> bool {
+    // A brief metadata open detects an existing writer without holding a handle
+    // while importing, so CAD applications remain free to save the model.
+    unsafe {
+        let handle = CreateFileW(
+            common::wide(path).as_ptr(),
+            FILE_READ_DATA | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_DELETE,
+            null(),
+            OPEN_EXISTING,
+            0,
+            null_mut(),
+        );
+        if handle == INVALID_HANDLE_VALUE {
+            matches!(
+                GetLastError(),
+                ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION
+            )
+        } else {
+            CloseHandle(handle);
+            false
+        }
     }
 }
 pub fn track_source(path: PathBuf) {
@@ -365,7 +404,14 @@ fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
     let mut files: HashMap<PathBuf, (Instant, u32)> = HashMap::new();
     let mut dirs = HashSet::new();
     let mut known: HashSet<PathBuf> = HashSet::new();
+    let mut failed: HashSet<PathBuf> = HashSet::new();
     if let Some(s) = &saved {
+        failed.extend(
+            s.failed_files
+                .iter()
+                .map(PathBuf::from)
+                .filter(|p| eligible(&cfg, p)),
+        );
         for p in s.known_files.iter().chain(s.files.iter()) {
             let p = PathBuf::from(p);
             if eligible(&cfg, &p) {
@@ -424,12 +470,20 @@ fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
                     Ok(p) => p,
                     Err(_) => break,
                 };
-                let result = b.thumbnail_priority(p.clone(), true);
+                let result = if writer_open(&p) {
+                    Err("Model is still open for writing".to_string())
+                } else {
+                    b.thumbnail_priority(p.clone(), true)
+                };
                 let ok = result.is_ok()
                     || result.as_ref().err().is_some_and(|e| {
-                        e.starts_with("Skipped:") || e.starts_with("Look import failed:")
+                        e.starts_with("Skipped:") && !e.contains("Look import failed:")
                     });
-                let _ = t.send(Event::Finished(p, ok));
+                let permanent = result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|e| e.contains("Look import failed:"));
+                let _ = t.send(Event::Finished(p, ok, permanent));
             }
         });
     }
@@ -493,14 +547,7 @@ fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
                                     dirs.insert(p);
                                 } else if eligible(&cfg, &p) {
                                     known.insert(p.clone());
-                                    files.insert(
-                                        p,
-                                        (
-                                            Instant::now()
-                                                + Duration::from_secs(cfg.settle_seconds),
-                                            0,
-                                        ),
-                                    );
+                                    files.insert(p, (Instant::now(), 0));
                                 }
                             }
                             cursors.insert(v.clone(), new);
@@ -550,11 +597,15 @@ fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
     loop {
         broker
             .state
+            .preflight_failed
+            .store(failed.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        broker
+            .state
             .preflight_pending
             .store(files.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let now = Instant::now();
         if dirty && now >= save_at {
-            if save(&cfg, &cursors, &files, &dirs, &known).is_ok() {
+            if save(&cfg, &cursors, &files, &dirs, &known, &failed).is_ok() {
                 dirty = false
             } else {
                 save_at = now + Duration::from_secs(5)
@@ -583,7 +634,7 @@ fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
                                 if active_files.contains(&p) {
                                     changed_active.insert(p.clone());
                                 }
-                                let due = now + Duration::from_secs(cfg.settle_seconds);
+                                let due = now;
                                 files
                                     .entry(p)
                                     .and_modify(|v| v.0 = v.0.max(due))
@@ -665,17 +716,21 @@ fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
             }
             let was_dirty = dirty;
             match event {
-                Event::File(p, settle) => {
+                Event::File(p, changed) => {
                     if eligible(&cfg, &p) {
                         known.insert(p.clone());
-                        if settle && active_files.contains(&p) {
+                        if changed && active_files.contains(&p) {
                             changed_active.insert(p.clone());
                         }
-                        let due = Instant::now()
-                            + Duration::from_secs(if settle { cfg.settle_seconds } else { 0 });
+                        let due = Instant::now();
+                        failed.remove(&p);
                         files
                             .entry(p)
-                            .and_modify(|v| v.0 = v.0.max(due))
+                            .and_modify(|v| {
+                                if changed {
+                                    *v = (due, 0);
+                                }
+                            })
                             .or_insert((due, 0));
                         dirty = true;
                     }
@@ -689,6 +744,7 @@ fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
                             known.retain(|v| !common::below(v, &p));
                         }
                         files.retain(|v, _| !common::below(v, &p));
+                        failed.retain(|v| !common::below(v, &p));
                         dirs.retain(|v| !common::below(v, &p));
                         dirty = true;
                     }
@@ -713,16 +769,19 @@ fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
                     crate::ui::update();
                     dirty = true;
                 }
-                Event::Finished(p, ok) => {
+                Event::Finished(p, ok, permanent) => {
                     if changed_active.remove(&p) {
                     } else if ok || !p.exists() {
                         files.remove(&p);
+                        failed.remove(&p);
                     } else if let Some(v) = files.get_mut(&p) {
                         v.1 += 1;
-                        if v.1 >= 3 {
+                        if permanent || v.1 >= 6 {
                             files.remove(&p);
+                            failed.insert(p.clone());
                         } else {
-                            v.0 = Instant::now() + Duration::from_secs(30)
+                            v.0 = Instant::now()
+                                + Duration::from_secs([1, 2, 5, 15, 30][v.1 as usize - 1])
                         }
                     }
                     active_files.remove(&p);
@@ -748,6 +807,20 @@ fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
                     }
                 }
                 Event::Wake => {}
+                Event::Rescan => {
+                    dirs.extend(cfg.roots_available());
+                    dirty = true;
+                }
+                Event::RetryFailed => {
+                    match crate::cache_index::retry_failures() {
+                        Ok(paths) => failed.extend(paths.into_iter().filter(|p| eligible(&cfg, p))),
+                        Err(e) => crate::cache_index::log(&e),
+                    }
+                    for p in failed.drain() {
+                        files.entry(p).or_insert((Instant::now(), 0));
+                    }
+                    dirty = true;
+                }
                 Event::Track(source) => {
                     if !watched.iter().any(|r| common::below(&source, r)) {
                         if let Some(parent) = source.parent() {
@@ -758,7 +831,7 @@ fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
                     }
                 }
                 Event::Shutdown(ack) => {
-                    let _ = save(&cfg, &cursors, &files, &dirs, &known);
+                    let _ = save(&cfg, &cursors, &files, &dirs, &known, &failed);
                     let _ = ack.send(());
                     break;
                 }

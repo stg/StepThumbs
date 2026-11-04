@@ -5,6 +5,7 @@ mod hooks_test;
 mod import_worker;
 mod journal;
 mod monitor;
+mod preview;
 mod ui;
 use anyhow::{Context, Result, bail};
 use look::{
@@ -52,6 +53,7 @@ struct Job {
     started: std::sync::atomic::AtomicBool,
     background: std::sync::atomic::AtomicBool,
     child: Mutex<Option<usize>>,
+    cancelled: std::sync::atomic::AtomicBool,
 }
 struct State {
     jobs: Mutex<HashMap<String, Arc<Job>>>,
@@ -66,6 +68,7 @@ struct State {
     source_bytes: std::sync::atomic::AtomicU64,
     promotions: std::sync::atomic::AtomicU64,
     preflight_pending: std::sync::atomic::AtomicU64,
+    preflight_failed: std::sync::atomic::AtomicU64,
     scans_started: std::sync::atomic::AtomicU64,
     journal_passes: std::sync::atomic::AtomicU64,
     current: Mutex<std::collections::HashSet<PathBuf>>,
@@ -166,7 +169,16 @@ fn finish(state: &State, job: &Arc<Job>, result: Outcome) {
     ui::update();
 }
 fn render(gpu: &mut WgpuRenderer, job: &Job, scene: &CompiledScene) -> Result<PathBuf> {
-    let c = &job.config;
+    let image = render_image(gpu, &job.config, scene)?;
+    let mut bytes = Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image).write_to(&mut bytes, image::ImageFormat::Png)?;
+    store_image(job, bytes.get_ref())
+}
+fn render_image(
+    gpu: &mut WgpuRenderer,
+    c: &Config,
+    scene: &CompiledScene,
+) -> Result<image::RgbaImage> {
     let material = if c.source_colours {
         MaterialMode::Source
     } else {
@@ -208,17 +220,15 @@ fn render(gpu: &mut WgpuRenderer, job: &Job, scene: &CompiledScene) -> Result<Pa
         .into_iter()
         .next()
         .context("No image produced")?;
-    let mut bytes = Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgba8(
-        image::RgbaImage::from_raw(image.width, image.height, image.rgba)
-            .context("Invalid pixel data")?,
-    )
-    .write_to(&mut bytes, image::ImageFormat::Png)?;
+    image::RgbaImage::from_raw(image.width, image.height, image.rgba).context("Invalid pixel data")
+}
+fn store_image(job: &Job, bytes: &[u8]) -> Result<PathBuf> {
+    let c = &job.config;
     if common::cache::identity(&job.path, c)? != job.key {
         bail!("Source changed during rendering")
     };
     let path = common::cache::directory().join(format!("{}.png", job.key));
-    common::cache::atomic_write(&path, bytes.get_ref())?;
+    common::cache::atomic_write(&path, bytes)?;
     if common::cache::identity(&job.path, c).ok().as_deref() != Some(job.key.as_str()) {
         let _ = fs::remove_file(&path);
         bail!("Source changed during rendering")
@@ -282,6 +292,9 @@ fn child_priority(handle: usize, low: bool) {
 }
 
 fn render_f3d(job: &Job) -> Result<PathBuf> {
+    store_image(job, &render_f3d_bytes(job)?)
+}
+fn render_f3d_bytes(job: &Job) -> Result<Vec<u8>> {
     use std::{
         os::windows::process::CommandExt,
         process::{Command, Stdio},
@@ -291,9 +304,9 @@ fn render_f3d(job: &Job) -> Result<PathBuf> {
     if !executable.is_file() {
         bail!("F3D is not installed")
     }
-    fs::create_dir_all(common::cache::directory())?;
-    let temp =
-        common::cache::directory().join(format!("{}.f3d-{}.png", job.key, std::process::id()));
+    let scratch = common::data_dir().join("scratch");
+    fs::create_dir_all(&scratch)?;
+    let temp = scratch.join(format!("{}.f3d-{}.png", job.key, std::process::id()));
     let mut cmd = Command::new(executable);
     cmd.args([
         "--config=thumbnail",
@@ -328,9 +341,7 @@ fn render_f3d(job: &Job) -> Result<PathBuf> {
     if !job.config.source_colours {
         cmd.args(["--color", "0.8,0.8,0.8"]);
     }
-    if job.config.antialias {
-        cmd.arg("--anti-aliasing");
-    }
+    cmd.arg(format!("--anti-aliasing={}", job.config.antialias));
     let mut child = cmd.spawn()?;
     use std::os::windows::io::AsRawHandle;
     struct ChildRegistration<'a>(&'a Job);
@@ -365,35 +376,18 @@ fn render_f3d(job: &Job) -> Result<PathBuf> {
                 Err(anyhow::anyhow!("F3D failed: {status}"))
             };
         }
-        if Instant::now() >= deadline {
+        if job.cancelled.load(std::sync::atomic::Ordering::Acquire) || Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
             break Err(anyhow::anyhow!("F3D timed out"));
         }
         thread::sleep(Duration::from_millis(100));
     };
-    let outcome = (|| -> Result<PathBuf> {
+    let outcome = (|| -> Result<Vec<u8>> {
         result?;
         let bytes = fs::read(&temp)?;
         image::load_from_memory(&bytes)?;
-        if common::cache::identity(&job.path, &job.config)? != job.key {
-            bail!("Source changed during rendering")
-        };
-        let dst = common::cache::directory().join(format!("{}.png", job.key));
-        common::cache::atomic_write(&dst, &bytes)?;
-        if common::cache::identity(&job.path, &job.config)
-            .ok()
-            .as_deref()
-            != Some(job.key.as_str())
-        {
-            let _ = fs::remove_file(&dst);
-            bail!("Source changed during rendering")
-        }
-        cache_index::remember(&job.path, &dst, &job.config).unwrap_or_else(|e| {
-            cache_index::log(&e);
-        });
-        cache_index::prune(job.config.max_cache_mb);
-        Ok(dst)
+        Ok(bytes)
     })();
     let _ = fs::remove_file(temp);
     outcome
@@ -473,6 +467,7 @@ impl Broker {
             source_bytes: 0.into(),
             promotions: 0.into(),
             preflight_pending: 0.into(),
+            preflight_failed: 0.into(),
             scans_started: 0.into(),
             journal_passes: 0.into(),
             current: Mutex::new(std::collections::HashSet::new()),
@@ -605,7 +600,8 @@ impl Broker {
                                     // A sharing violation or worker startup failure must
                                     // remain retryable when the file becomes readable.
                                     if permanent {
-                                        if let Err(e) = cache_index::mark_failed(&job.key, &message)
+                                        if let Err(e) =
+                                            cache_index::mark_failed(&job.key, &job.path, &message)
                                         {
                                             cache_index::log(&e);
                                         }
@@ -797,6 +793,7 @@ impl Broker {
                     started: false.into(),
                     background: background.into(),
                     child: Mutex::new(None),
+                    cancelled: false.into(),
                 });
                 jobs.insert(key, job.clone());
                 if background {
@@ -874,7 +871,7 @@ impl Broker {
             .as_ref()
             .map(|p| p.to_string_lossy().to_string());
         let limit = self.cache_limit_mb;
-        serde_json::json!({"queued":self.state.jobs.lock().unwrap().len(),"gpu":if self.state.gpu_active.load(Ordering::SeqCst){"in use"}else{"released"},"success":self.state.success.load(Ordering::Relaxed),"failures":self.state.failures.load(Ordering::Relaxed),"cache_hits":self.state.hits.load(Ordering::Relaxed)+self.shared_stats.as_ref().map(|v|v.hits()).unwrap_or(0),"cache_inventory_passes":cache_index::inventory_passes(),"cache_ready":usage.is_some(),"cache_files":count,"cache_bytes":bytes,"paused":*self.state.paused.lock().unwrap(),"preflight_pending":self.state.preflight_pending.load(Ordering::Relaxed),"scans_started":self.state.scans_started.load(Ordering::Relaxed),"journal_passes":self.state.journal_passes.load(Ordering::Relaxed),"source_bytes":self.state.source_bytes.load(Ordering::Relaxed),"promotions":self.state.promotions.load(Ordering::Relaxed),"current":current,"current_files":current_files,"scanning":scanning,"memory_bytes":memory,"cpu_seconds":cpu,"cache_limit_mb":limit,"recent":self.state.recent.lock().unwrap().iter().map(|entry|entry.text.clone()).collect::<Vec<_>>()})
+        serde_json::json!({"queued":self.state.jobs.lock().unwrap().len(),"gpu":if self.state.gpu_active.load(Ordering::SeqCst){"in use"}else{"released"},"success":self.state.success.load(Ordering::Relaxed),"failures":self.state.failures.load(Ordering::Relaxed),"cache_hits":self.state.hits.load(Ordering::Relaxed)+self.shared_stats.as_ref().map(|v|v.hits()).unwrap_or(0),"cache_inventory_passes":cache_index::inventory_passes(),"cache_ready":usage.is_some(),"cache_files":count,"cache_bytes":bytes,"paused":*self.state.paused.lock().unwrap(),"preflight_pending":self.state.preflight_pending.load(Ordering::Relaxed),"preflight_failed":self.state.preflight_failed.load(Ordering::Relaxed),"import_processes_started":import_worker::started(),"scans_started":self.state.scans_started.load(Ordering::Relaxed),"journal_passes":self.state.journal_passes.load(Ordering::Relaxed),"source_bytes":self.state.source_bytes.load(Ordering::Relaxed),"promotions":self.state.promotions.load(Ordering::Relaxed),"current":current,"current_files":current_files,"scanning":scanning,"memory_bytes":memory,"cpu_seconds":cpu,"cache_limit_mb":limit,"recent":self.state.recent.lock().unwrap().iter().map(|entry|entry.text.clone()).collect::<Vec<_>>()})
     }
 }
 fn serve(broker: Arc<Broker>) -> Result<()> {
