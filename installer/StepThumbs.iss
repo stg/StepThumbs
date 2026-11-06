@@ -21,6 +21,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 DisableProgramGroupPage=yes
 DisableDirPage=yes
+ChangesAssociations=yes
 UsePreviousAppDir=no
 OutputDir=..\dist
 OutputBaseFilename=StepThumbs-{#AppVersion}-Setup

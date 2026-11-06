@@ -143,7 +143,7 @@ impl Config {
             || !(0.0..=3.0).contains(&self.ao_strength)
             || !(1.0..=100.0).contains(&self.ao_radius)
             || !(0.0..=1.0).contains(&self.edge_strength)
-            || !(1.0..=3.0).contains(&self.edge_width)
+            || !(0.25..=3.0).contains(&self.edge_width)
             || !(0.0..=2.0).contains(&self.ambient)
             || !(0.0..=10.0).contains(&self.light_intensity)
         {
@@ -188,7 +188,11 @@ impl Config {
     }
     pub fn profile(&self) -> String {
         let value = serde_json::json!([
-            "rust-look-effects-v1",
+            if self.renderer == "look" && self.edges {
+                "rust-look-normal-edges-v2"
+            } else {
+                "rust-look-effects-v1"
+            },
             self.renderer,
             self.transparent,
             self.background,
