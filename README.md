@@ -23,7 +23,7 @@ an upgrade.
 - **Windows clearing its cache doesn't mean starting over.** StepThumbs keeps
   its own disk cache, which Explorer's thumbnail provider reads directly without
   waking the renderer.
-- **STEP, STP, STL and GLB.** Render with source colours, edges, ambient occlusion
+- **STEP, STP, STL and GLB.** Render with source colours, smooth edges, ambient occlusion
   and transparent or coloured backgrounds; try changes in the live preview
   using the supplied model or your own.
 - **A quiet 3D tray icon.** Open activity, cache usage and settings from the tray,

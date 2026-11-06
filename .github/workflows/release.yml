@@ -83,6 +83,18 @@ jobs:
           APP_VERSION: ${{ steps.version.outputs.value }}
         run: |
           $installer = "StepThumbs-$env:APP_VERSION-Setup.exe"
+          $existing = gh release view $env:RELEASE_TAG --json assets 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            $assetNames = ($existing | ConvertFrom-Json).assets.name
+            $missing = @($installer, 'SHA256SUMS.txt') | Where-Object { $_ -notin $assetNames }
+            if ($missing.Count) {
+              $files = @($missing | ForEach-Object { "dist/$_" })
+              gh release upload $env:RELEASE_TAG @files
+              if ($LASTEXITCODE) { throw 'Release asset upload failed.' }
+            }
+            Write-Output 'Release assets are already available.'
+            exit 0
+          }
           $download = "https://github.com/$env:GH_REPO/releases/download/$env:RELEASE_TAG/$installer"
           $notes = Join-Path $env:RUNNER_TEMP 'release-notes.md'
           @(
