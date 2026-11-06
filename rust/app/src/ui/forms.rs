@@ -14,7 +14,7 @@ pub unsafe fn build(hwnd: HWND, cfg: &Config) -> Controls {
         TCS_FIXEDWIDTH,
         10,
         8,
-        626,
+        510,
         25,
         9,
     );
@@ -31,6 +31,18 @@ pub unsafe fn build(hwnd: HWND, cfg: &Config) -> Controls {
         SendMessageW(tabs, TCM_INSERTITEMW, i, &item as *const _ as isize);
     }
     tab_size(tabs);
+    control(
+        hwnd,
+        "STATIC",
+        concat!("v", env!("CARGO_PKG_VERSION")),
+        windows_sys::Win32::System::SystemServices::SS_RIGHT
+            | windows_sys::Win32::System::SystemServices::SS_CENTERIMAGE,
+        536,
+        8,
+        96,
+        25,
+        8,
+    );
     let mut pages: [Vec<HWND>; 4] = Default::default();
     let mut add = |p: usize, h| {
         pages[p].push(h);

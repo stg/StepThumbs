@@ -10,6 +10,9 @@ an upgrade.
 - **Very low resource usage.** Zero CPU/GPU work and about 29 MB RAM while
   idling, with GPU resources released after jobs. Preflighting wakes on filesystem
   changes, with no Windows service or periodic rescans.
+- **Designed to stay out of your way.** Low CPU and RAM use, low-priority
+  preflighting and a tray icon matching Windows' standard icons keep its impact
+  on your system small.
 - **About 5× faster on the tested assembly.** My 6.7 MB STEP assembly took about
   a second with the modified Look renderer, against 5–6 seconds with F3D.
   A cached thumbnail returned in 16 ms.

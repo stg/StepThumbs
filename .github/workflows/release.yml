@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Installer version (for example 0.3.5); artifacts only'
+        description: 'Installer version (for example 0.3.6); artifacts only'
         required: true
-        default: '0.3.5'
+        default: '0.3.6'
 
 permissions:
   contents: read
@@ -82,5 +82,13 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
           APP_VERSION: ${{ steps.version.outputs.value }}
         run: |
-          gh release create $env:RELEASE_TAG "dist/StepThumbs-$env:APP_VERSION-Setup.exe" dist/SHA256SUMS.txt --verify-tag --title "StepThumbs $env:APP_VERSION" --generate-notes
+          $installer = "StepThumbs-$env:APP_VERSION-Setup.exe"
+          $download = "https://github.com/$env:GH_REPO/releases/download/$env:RELEASE_TAG/$installer"
+          $notes = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          @(
+            "[**Download $installer**]($download)"
+            ''
+            'Run the installer, then open **StepThumbs** from the Start menu.'
+          ) | Set-Content -LiteralPath $notes -Encoding utf8
+          gh release create $env:RELEASE_TAG "dist/$installer" dist/SHA256SUMS.txt --verify-tag --title "StepThumbs $env:APP_VERSION" --notes-file $notes --generate-notes
           if ($LASTEXITCODE) { throw 'Release publication failed.' }
