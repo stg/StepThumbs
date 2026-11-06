@@ -7,6 +7,9 @@ an upgrade.
 
 ![STEP thumbnails](assets/thumbnails.png)
 
+- **Very low resource usage.** Zero CPU/GPU work and about 29 MB RAM while
+  idling, with GPU resources released after jobs. Preflighting wakes on filesystem
+  changes, with no Windows service or periodic rescans.
 - **About 5× faster on the tested assembly.** My 6.7 MB STEP assembly took about
   a second with the modified Look renderer, against 5–6 seconds with F3D.
   A cached thumbnail returned in 16 ms.
@@ -15,10 +18,6 @@ an upgrade.
   cache miss gets foreground priority.
 - **Windows clearing its cache doesn't mean starting over.** StepThumbs keeps
   its own disk cache, which Explorer's thumbnail provider checks first.
-- **Low RAM. Zero CPU/GPU work while idle.** About 28 MiB of idle RAM in local
-  tests, with the app sleeping between jobs and releasing GPU resources.
-  No Windows service or periodic rescans. With no work pending, preflighting
-  sleeps until a filesystem change wakes it.
 - **STEP, STP, STL and GLB.** Render with source colours, edges, ambient occlusion
   and transparent or coloured backgrounds; try changes in the live preview
   using the supplied model or your own.
@@ -27,7 +26,8 @@ an upgrade.
 
 ## Install
 
-1. Download the [installer from Releases](../../releases/latest) and run it.
+1. Download the [installer from Releases](https://github.com/stg/StepThumbs/releases/latest)
+   or [build it from source](#build), then run the installer.
 2. Open **StepThumbs** from the Windows Start menu. Its **3D** icon appears in the
    tray; check the hidden-icons arrow if you don't see it.
 3. Right-click the icon and choose **Configure** to open **File types**.
@@ -53,7 +53,7 @@ Clone with `--recurse-submodules`. With Rust/MSVC and the Windows SDK installed:
 cargo build --release --locked
 ```
 
-`cargo xtask dist` builds the installer with Inno Setup 7.1.1 installed.
+`cargo xtask dist` builds the installer in `dist/` with Inno Setup 7.1.1 installed.
 
 ## Credits
 
