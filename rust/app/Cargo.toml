@@ -1,11 +1,11 @@
 [package]
 name = "stepthumbnail-app"
-version = "0.3.6"
+version = "0.4.0"
 license = "MIT"
 edition = "2024"
 build = "build.rs"
 [[bin]]
-name = "StepThumbs"
+name = "StepThumbsEngine"
 path = "src/main.rs"
 [dependencies]
 stepthumbnail-common = { path = "../common" }

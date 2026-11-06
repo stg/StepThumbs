@@ -112,7 +112,16 @@ unsafe fn exe_path() -> Option<PathBuf> {
         return None;
     }
     use std::os::windows::ffi::OsStringExt;
-    Some(PathBuf::from(std::ffi::OsString::from_wide(&buf[..n])).with_file_name("StepThumbs.exe"))
+    let peer =
+        PathBuf::from(std::ffi::OsString::from_wide(&buf[..n])).with_file_name("StepThumbs.exe");
+    if let Some(installed) = common::hooks::installed_executable() {
+        let family =
+            |path: &std::path::Path| path.parent().and_then(|p| p.parent()).map(common::path_key);
+        if family(&peer) == family(&installed) {
+            return Some(installed);
+        }
+    }
+    Some(peer)
 }
 unsafe fn make_bitmap(path: &std::path::Path, size: u32) -> anyhow::Result<HBITMAP> {
     let side = size.min(512);

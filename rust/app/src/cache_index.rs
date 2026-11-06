@@ -24,6 +24,7 @@ static READY: AtomicBool = AtomicBool::new(false);
 static COUNT: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
 static INVENTORIES: AtomicU64 = AtomicU64::new(0);
+static HINTS_DIRTY: AtomicBool = AtomicBool::new(false);
 pub fn inventory_passes() -> u64 {
     INVENTORIES.load(Ordering::Relaxed)
 }
@@ -61,33 +62,65 @@ impl Index {
             stmt.query_map([], |r| r.get(0))?
                 .collect::<rusqlite::Result<HashSet<String>>>()?
         };
-        // One directory inventory at startup. All later accounting and pruning
-        // use individual changed entries and the database's age index.
-        let tx = db.transaction()?;
-        tx.execute("DELETE FROM cached_files", [])?;
-        INVENTORIES.fetch_add(1, Ordering::Relaxed);
-        let (mut count, mut bytes) = (0, 0);
-        for entry in fs::read_dir(common::cache::directory())?.flatten() {
-            let path = entry.path();
-            let Some(key) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            if path.extension().is_none_or(|e| e != "png") || !valid_key(key) {
-                continue;
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);",
+        )?;
+        let inventoried: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM metadata WHERE key='inventory')",
+            [],
+            |r| r.get(0),
+        )?;
+        let previous_inventories: u64 = db
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM metadata WHERE key='inventory'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0) as u64;
+        let cold = !crate::runtime::enabled() || crate::runtime::cold();
+        // One inventory per tray session (and crash recovery), never on routine
+        // engine wake-up. This also reconciles manual edits to the cache folder.
+        let inventories = previous_inventories + u64::from(!inventoried || cold);
+        let (count, bytes) = if !inventoried || cold {
+            let tx = db.transaction()?;
+            tx.execute("DELETE FROM cached_files", [])?;
+
+            let (mut count, mut bytes) = (0u64, 0u64);
+            for entry in fs::read_dir(common::cache::directory())?.flatten() {
+                let path = entry.path();
+                let Some(key) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if path.extension().is_none_or(|e| e != "png") || !valid_key(key) {
+                    continue;
+                }
+                let Ok(m) = entry.metadata() else { continue };
+                let size = m.len()
+                    + fs::metadata(path.with_extension("txt"))
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                tx.execute(
+                    "INSERT INTO cached_files VALUES(?1,?2,?3)",
+                    params![key, size as i64, m.last_write_time() as i64],
+                )?;
+                count += 1;
+                bytes += size;
             }
-            let Ok(m) = entry.metadata() else { continue };
-            let size = m.len()
-                + fs::metadata(path.with_extension("txt"))
-                    .map(|m| m.len())
-                    .unwrap_or(0);
             tx.execute(
-                "INSERT INTO cached_files VALUES(?1,?2,?3)",
-                params![key, size as i64, m.last_write_time() as i64],
+                "INSERT OR REPLACE INTO metadata VALUES('inventory',?1)",
+                [inventories.to_string()],
             )?;
-            count += 1;
-            bytes += size;
-        }
-        tx.commit()?;
+            tx.commit()?;
+            (count, bytes)
+        } else {
+            db.query_row(
+                "SELECT COUNT(*),COALESCE(SUM(bytes),0) FROM cached_files",
+                [],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+            )?
+        };
+        INVENTORIES.store(inventories, Ordering::Relaxed);
         let result = Self {
             db,
             directories,
@@ -154,6 +187,7 @@ impl Index {
         Ok(old.is_some())
     }
     fn remove_source(&mut self, key: &str, path: &Path) -> Result<()> {
+        HINTS_DIRTY.store(true, Ordering::Relaxed);
         self.db
             .execute("DELETE FROM sources WHERE path_key=?1", [key])?;
         for parent in path.ancestors().skip(1).map(common::path_key) {
@@ -243,6 +277,7 @@ pub fn remember(path: &Path, image: &Path, cfg: &Config) -> Result<()> {
         }
         tx.commit()?;
         index.directories.extend(parents);
+        HINTS_DIRTY.store(true, Ordering::Relaxed);
     }
     let companion = image.with_extension("txt");
     if !companion.is_file() {
@@ -389,6 +424,31 @@ pub fn failed(key: &str) -> Result<Option<String>> {
         )
         .optional()?)
 }
+pub fn forget_missing(key: &str) -> Result<()> {
+    let image = common::cache::directory().join(format!("{key}.png"));
+    let mut index = index()?.lock().unwrap();
+    if !image.exists() {
+        let old: Option<i64> = index
+            .db
+            .query_row(
+                "SELECT bytes FROM cached_files WHERE cache_key=?1",
+                [key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(bytes) = old {
+            // Another request may be publishing this image. Change accounting
+            // only; never delete a file from a cache-miss fast path.
+            index
+                .db
+                .execute("DELETE FROM cached_files WHERE cache_key=?1", [key])?;
+            index.count = index.count.saturating_sub(1);
+            index.bytes = index.bytes.saturating_sub(bytes as u64);
+            index.publish();
+        }
+    }
+    Ok(())
+}
 pub fn mark_failed(key: &str, path: &Path, error: &str) -> Result<()> {
     let key = format!("{}:{key}", env!("CARGO_PKG_VERSION"));
     let mut index = index()?.lock().unwrap();
@@ -421,6 +481,7 @@ pub fn retry_failures() -> Result<Vec<PathBuf>> {
 }
 pub fn clear_images() -> Result<()> {
     let mut index = index()?.lock().unwrap();
+    HINTS_DIRTY.store(true, Ordering::Relaxed);
     // Explicit maintenance uses the index, never a recursive folder traversal.
     let keys = {
         let mut stmt = index.db.prepare("SELECT cache_key FROM cached_files")?;
@@ -472,4 +533,57 @@ mod tests {
             ))));
         }
     }
+}
+
+pub fn needs_link_backfill() -> bool {
+    index().ok().is_some_and(|v| {
+        !v.lock()
+            .unwrap()
+            .db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM metadata WHERE key='links')",
+                [],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap_or(false)
+    })
+}
+pub fn finish_link_backfill() -> Result<()> {
+    index()?
+        .lock()
+        .unwrap()
+        .db
+        .execute("INSERT OR IGNORE INTO metadata VALUES('links','1')", [])?;
+    Ok(())
+}
+pub fn export_host_hints() -> Result<()> {
+    let index = index()?.lock().unwrap();
+    let path = common::data_dir().join("host-directories.bin");
+    index.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    if !HINTS_DIRTY.load(Ordering::Relaxed) && path.exists() {
+        return Ok(());
+    }
+    let mut bits = vec![0u8; common::host::BLOOM_BYTES];
+    for parent in &index.directories {
+        common::host::bloom_add(&mut bits, parent);
+    }
+    let roots = common::host::watch_roots(&Config::load()?);
+    let mut stmt = index.db.prepare("SELECT path_key,path FROM sources")?;
+    for source in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+        let (key, source) = source?;
+        common::host::bloom_add(&mut bits, &key);
+        let source = Path::new(&source);
+        if !roots.iter().any(|p| common::below(source, p)) {
+            common::host::track_source(source)?;
+        }
+    }
+    if fs::read(&path).ok().as_deref() != Some(bits.as_slice()) {
+        common::cache::atomic_write(&path, &bits)?;
+    }
+    HINTS_DIRTY.store(false, Ordering::Relaxed);
+    Ok(())
+}
+pub fn refresh_host_hints() -> Result<()> {
+    HINTS_DIRTY.store(true, Ordering::Relaxed);
+    export_host_hints()
 }

@@ -7,6 +7,13 @@ pub const CLASS: &str = "{86F9B3AC-39AE-4EB1-AD06-819BE42B2019}";
 pub const HANDLER: &str = "{E357FCCD-A995-4576-B01F-234630154E96}";
 const STARTUP: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const STARTUP_NAME: &str = "StepThumbnail Preflight";
+pub fn installed_executable() -> Option<std::path::PathBuf> {
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(format!(r"Software\Classes\CLSID\{CLASS}\InprocServer32"))
+        .ok()
+        .and_then(|key| key.get_value::<String, _>("").ok())
+        .map(|dll| std::path::PathBuf::from(dll).with_file_name("StepThumbs.exe"))
+}
 #[derive(Clone, Debug)]
 pub struct HookStatus {
     pub extension: String,

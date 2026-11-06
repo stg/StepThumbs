@@ -31,6 +31,7 @@ static mut FONT: HFONT = null_mut();
 static mut TRAY_ICON: HICON = null_mut();
 static mut APP_ICON: HICON = null_mut();
 static SNAPSHOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SHOW_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static INITIAL_PAGE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static SNAPSHOT_DPI: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(96);
 static COMPACT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -50,6 +51,12 @@ pub fn preview_ready() {
 fn restart(page: usize) {
     let broker = BROKER.get().unwrap().clone();
     std::thread::spawn(move || {
+        if crate::runtime::enabled() {
+            let _ = common::host::request(common::host::RELOAD, (page + 1) as u64);
+            broker.drain();
+            quit();
+            return;
+        }
         broker.drain();
         use std::os::windows::process::CommandExt;
         if let Ok(exe) = std::env::current_exe() {
@@ -77,7 +84,13 @@ pub fn quit() {
         }
     }
 }
+pub fn show_page(page: usize) {
+    INITIAL_PAGE.store(page, Ordering::Release);
+    show();
+}
 pub fn show() {
+    SHOW_REQUESTED.store(true, Ordering::Release);
+    crate::runtime::visible(true);
     let h = WINDOW.load(Ordering::Acquire) as HWND;
     if !h.is_null() {
         unsafe {
@@ -86,6 +99,7 @@ pub fn show() {
     }
 }
 pub fn update() {
+    crate::runtime::changed();
     let h = WINDOW.load(Ordering::Acquire) as HWND;
     if !h.is_null() && !UPDATE_PENDING.swap(true, Ordering::AcqRel) {
         unsafe {
@@ -490,10 +504,13 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
             APP_ICON = icon(include_bytes!("../assets/app.ico"), 32);
             SendMessageW(hwnd, WM_SETICON, 1, APP_ICON as isize);
             SendMessageW(hwnd, WM_SETICON, 0, APP_ICON as isize);
-            if !SNAPSHOT.load(Ordering::Relaxed) {
+            if !SNAPSHOT.load(Ordering::Relaxed) && !crate::runtime::enabled() {
                 notify(hwnd, NIM_ADD, TRAY_ICON);
-            } else {
+            } else if SNAPSHOT.load(Ordering::Relaxed) {
                 initialize_controls(hwnd);
+            }
+            if crate::runtime::enabled() {
+                crate::runtime::start(BROKER.get().unwrap().clone());
             }
             0
         }
@@ -561,7 +578,7 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
                         cfg.max_file_mb = get(s.max_file).parse()?;
                         cfg.start_with_windows = check(s.startup);
                         cfg.save()?;
-                        common::hooks::startup(cfg.start_with_windows, &std::env::current_exe()?)?;
+                        common::hooks::startup(cfg.start_with_windows, &std::env::current_exe()?.with_file_name("StepThumbs.exe"))?;
                         Ok(())
                     })();
                     if let Err(e) = result {
@@ -744,7 +761,9 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
         WM_SETTINGCHANGE | WM_THEMECHANGED => {
             let new = tray_icon(hwnd);
             if !new.is_null() {
-                notify(hwnd, NIM_MODIFY, new);
+                if !crate::runtime::enabled() {
+                    notify(hwnd, NIM_MODIFY, new);
+                }
                 DestroyIcon(TRAY_ICON);
                 TRAY_ICON = new;
             }
@@ -780,7 +799,9 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
             );
             let new = tray_icon(hwnd);
             if !new.is_null() {
-                notify(hwnd, NIM_MODIFY, new);
+                if !crate::runtime::enabled() {
+                    notify(hwnd, NIM_MODIFY, new);
+                }
                 DestroyIcon(TRAY_ICON);
                 TRAY_ICON = new;
             }
@@ -819,7 +840,9 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
             0
         }
         SHOW => {
+            SHOW_REQUESTED.store(false, Ordering::Release);
             initialize_controls(hwnd);
+            page(INITIAL_PAGE.load(Ordering::Acquire));
             layout::show(hwnd);
             schedule_preview(hwnd);
             status();
@@ -838,10 +861,11 @@ unsafe fn window_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
             }
             release_preview(hwnd);
             ShowWindow(hwnd, SW_HIDE);
+            crate::runtime::visible(false);
             0
         }
         WM_DESTROY => {
-            if !SNAPSHOT.load(Ordering::Relaxed) {
+            if !SNAPSHOT.load(Ordering::Relaxed) && !crate::runtime::enabled() {
                 notify(hwnd, NIM_DELETE, TRAY_ICON);
             }
             DestroyIcon(TRAY_ICON);
@@ -908,7 +932,8 @@ pub fn run(broker: Arc<Broker>, visible: bool, initial_page: usize) -> anyhow::R
         WINDOW.store(hwnd as isize, Ordering::Release);
         if QUIT_REQUESTED.load(Ordering::Acquire) {
             PostMessageW(hwnd, QUIT, 0, 0);
-        } else if visible {
+        } else if visible || SHOW_REQUESTED.swap(false, Ordering::AcqRel) {
+            crate::runtime::visible(true);
             initialize_controls(hwnd);
             layout::show(hwnd);
             schedule_preview(hwnd);

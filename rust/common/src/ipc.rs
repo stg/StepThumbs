@@ -3,9 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
     io::{Read, Write},
-    os::windows::{io::FromRawHandle, process::CommandExt},
+    os::windows::io::FromRawHandle,
     path::Path,
-    process::Command,
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{Foundation::*, Storage::FileSystem::*, System::Pipes::*};
@@ -78,6 +77,9 @@ pub fn pipe_name() -> String {
         &blake3::hash(crate::data_dir().to_string_lossy().as_bytes()).to_hex()[..20]
     )
 }
+pub fn engine_pipe_name() -> String {
+    format!("{}.Engine", pipe_name())
+}
 pub fn write<T: Serialize>(file: &mut File, value: &T) -> Result<()> {
     let bytes = serde_json::to_vec(value)?;
     if bytes.len() > 65536 {
@@ -100,17 +102,51 @@ pub fn read<T: serde::de::DeserializeOwned>(file: &mut File) -> Result<T> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 pub fn exists() -> bool {
+    exists_at(&pipe_name())
+}
+fn exists_at(name: &str) -> bool {
     unsafe {
-        WaitNamedPipeW(crate::wide(pipe_name()).as_ptr(), 500) != 0
-            || GetLastError() == ERROR_SEM_TIMEOUT
+        WaitNamedPipeW(crate::wide(name).as_ptr(), 500) != 0 || GetLastError() == ERROR_SEM_TIMEOUT
     }
 }
 pub fn call(request: &Request, exe: Option<&Path>) -> Result<Response> {
-    let name = crate::wide(pipe_name());
-    let deadline = Instant::now() + Duration::from_secs(12);
-    let mut launched = false;
-    let handle = loop {
-        let h = unsafe {
+    call_at(request, exe, &pipe_name())
+}
+pub fn call_engine(request: &Request) -> Result<Response> {
+    call_at(request, None, &engine_pipe_name())
+}
+fn call_at(request: &Request, exe: Option<&Path>, name: &str) -> Result<Response> {
+    match request {
+        Request::Status if !exists_at(name) => {
+            if let Some(status) = crate::host::idle_status() {
+                return Ok(Response::status(status));
+            }
+        }
+        Request::Show => {
+            if crate::host::ensure(crate::host::SHOW, exe).is_ok() {
+                return Ok(Response::ok());
+            }
+        }
+        Request::Pause { paused } => {
+            if let Ok((h, _)) = crate::host::request(crate::host::STATUS, 0) {
+                if (*paused) == (h[4] & 1 != 0) {
+                    crate::host::request(crate::host::TOGGLE, 0)?;
+                }
+                return Ok(Response::ok());
+            }
+        }
+        Request::Shutdown => {
+            if crate::host::request(crate::host::QUIT, 0).is_ok() {
+                return Ok(Response::ok());
+            }
+        }
+        _ => {}
+    }
+    let name = crate::wide(name);
+    let until = Instant::now() + Duration::from_secs(120);
+    let mut wake_sent = false;
+    loop {
+        let handle = unsafe {
             CreateFileW(
                 name.as_ptr(),
                 GENERIC_READ | GENERIC_WRITE,
@@ -121,66 +157,135 @@ pub fn call(request: &Request, exe: Option<&Path>) -> Result<Response> {
                 std::ptr::null_mut(),
             )
         };
-        if h != INVALID_HANDLE_VALUE {
-            break h;
-        }
-        let error = unsafe { GetLastError() };
-        if error != ERROR_PIPE_BUSY
-            && error != ERROR_FILE_NOT_FOUND
-            && error != ERROR_PATH_NOT_FOUND
-        {
-            return Err(std::io::Error::from_raw_os_error(error as i32).into());
-        }
-        if !launched && error != ERROR_PIPE_BUSY {
-            if let Some(exe) = exe {
-                Command::new(exe)
-                    .arg("--background")
-                    .creation_flags(0x08000000)
-                    .spawn()?;
+        if handle == INVALID_HANDLE_VALUE {
+            if matches!(request, Request::Status) {
+                if let Some(status) = crate::host::idle_status() {
+                    return Ok(Response::status(status));
+                }
             }
-            launched = true;
+            let error = unsafe { GetLastError() };
+            if !matches!(
+                error,
+                ERROR_PIPE_BUSY | ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND
+            ) {
+                return Err(std::io::Error::from_raw_os_error(error as i32).into());
+            }
+            if Instant::now() >= until {
+                bail!("StepThumbs did not respond");
+            }
+            if error != ERROR_PIPE_BUSY && !wake_sent {
+                crate::host::ensure(crate::host::WAKE, exe)?;
+                wake_sent = true;
+            }
+            unsafe {
+                WaitNamedPipeW(name.as_ptr(), 100);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
         }
-        if Instant::now() > deadline {
-            bail!("StepThumbs did not respond")
+        let mut pipe = unsafe { File::from_raw_handle(handle) };
+        let response = write(&mut pipe, request).and_then(|()| read::<Response>(&mut pipe));
+        match response {
+            Ok(v) if v.error.as_deref() != Some("Engine is restarting") => return Ok(v),
+            Ok(_) => {
+                if matches!(request, Request::Status) {
+                    if let Some(status) = crate::host::idle_status() {
+                        return Ok(Response::status(status));
+                    }
+                }
+            }
+            Err(e) => {
+                let retry = e.downcast_ref::<std::io::Error>().is_some_and(|v| {
+                    matches!(
+                        v.kind(),
+                        std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::UnexpectedEof
+                            | std::io::ErrorKind::ConnectionReset
+                    )
+                });
+                if !retry {
+                    return Err(e);
+                }
+            }
         }
-        unsafe { WaitNamedPipeW(name.as_ptr(), 200) };
+        if Instant::now() >= until {
+            bail!("StepThumbs did not respond");
+        }
+        wake_sent = false;
         std::thread::sleep(Duration::from_millis(20));
-    };
-    let mut pipe = unsafe { File::from_raw_handle(handle) };
-    write(&mut pipe, request)?;
-    read(&mut pipe)
-}
-pub fn accept() -> Result<File> {
-    // Owner-only DACL and local clients only. No network listener is created.
-    let mut descriptor = std::ptr::null_mut();
-    let text = crate::wide("D:P(A;;GA;;;SY)(A;;GA;;;OW)");
-    let ok = unsafe {
-        windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW(text.as_ptr(),1,&mut descriptor,std::ptr::null_mut())
-    };
-    if ok == 0 {
-        return Err(std::io::Error::last_os_error().into());
     }
-    let security = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: descriptor,
+}
+pub fn create_pipe(name: &str, overlapped: bool, buffer: u32) -> Result<HANDLE> {
+    // Build the owner ACL directly; no SDDL parser is loaded into the tray.
+    use windows_sys::Win32::{
+        Security::*,
+        System::{SystemServices::*, Threading::*},
+    };
+    #[repr(align(8))]
+    struct Aligned([u8; 256]);
+    let mut token = std::ptr::null_mut();
+    let mut user = Aligned([0; 256]);
+    let mut needed = 0;
+    unsafe {
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let ok = GetTokenInformation(
+            token,
+            TokenUser,
+            user.0.as_mut_ptr().cast(),
+            256,
+            &mut needed,
+        );
+        CloseHandle(token);
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    let mut acl = Aligned([0; 256]);
+    let mut descriptor: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
+    unsafe {
+        let sid = (*(user.0.as_ptr().cast::<TOKEN_USER>())).User.Sid;
+        if InitializeAcl(acl.0.as_mut_ptr().cast(), 256, ACL_REVISION) == 0
+            || AddAccessAllowedAce(acl.0.as_mut_ptr().cast(), ACL_REVISION, GENERIC_ALL, sid) == 0
+            || InitializeSecurityDescriptor(
+                (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(),
+                SECURITY_DESCRIPTOR_REVISION,
+            ) == 0
+            || SetSecurityDescriptorDacl(
+                (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(),
+                1,
+                acl.0.as_ptr().cast(),
+                0,
+            ) == 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    let security = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(),
         bInheritHandle: 0,
     };
     let handle = unsafe {
         CreateNamedPipeW(
-            crate::wide(pipe_name()).as_ptr(),
-            PIPE_ACCESS_DUPLEX,
+            crate::wide(name).as_ptr(),
+            PIPE_ACCESS_DUPLEX | if overlapped { FILE_FLAG_OVERLAPPED } else { 0 },
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             32,
-            65536,
-            65536,
+            buffer,
+            buffer,
             0,
             &security,
         )
     };
-    unsafe { LocalFree(descriptor) };
     if handle == INVALID_HANDLE_VALUE {
         return Err(std::io::Error::last_os_error().into());
     }
+    Ok(handle)
+}
+pub fn accept_engine() -> Result<File> {
+    let handle = create_pipe(&engine_pipe_name(), false, 65536)?;
     let connected = unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) };
     if connected == 0 && unsafe { GetLastError() } != ERROR_PIPE_CONNECTED {
         unsafe { CloseHandle(handle) };

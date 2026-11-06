@@ -1,41 +1,24 @@
-#![cfg_attr(not(feature = "std"), no_std)]
-#![cfg_attr(not(feature = "std"), no_main)]
 #![windows_subsystem = "windows"]
 #![allow(unsafe_op_in_unsafe_fn)]
 
-//! Isolated memory/lifecycle experiment; does not install hooks or replace StepThumbs.
-//! Build here with `cargo build --release`. Default: tray, one overlapped pipe,
-//! recursive fixed-drive notifications, and a reusable stub worker (60 s idle exit).
-//! `--watch PATH` / `--exclude PATH` repeat; `--no-auto` only queues changes.
-//! `--engine-command CMDLINE` launches a real engine instead of the lifecycle stub.
-//! `--no-watch`, `--no-tray`, `--worker-idle-ms N` are measurement controls.
-//! Comparison features: std, resident-shell, png-icon, segment-heap; --no-default-features
-//! also enables text input infrastructure, which this host never needs.
-//!
-//! Pipe: \\.\pipe\StepThumbs.HostProbe.<PID>, current-user ACL, local clients only.
-//! Request: LE u32 magic 0x53544850, u32 opcode, u64 argument. Reply: 32 LE u64s
-//! (see snapshot), then payload. Opcodes: status=1, quit=2, wake=3, take=4,
-//! acknowledge generation=5, toggle auto=6, kill worker=7, menu probe=8.
-//! TAKE records: u32 byte size, u16 root, u16 directory action (0=file), UTF-16 path.
-//! Files need a metadata probe; directory records need only targeted prefix work.
-//! A reconciliation mask means notifications overflowed, not a routine root scan.
-//! The engine must persist checkpoints and acknowledge only after durable acceptance.
-//! This prototype intentionally has no model index, SQLite, render code, or settings UI.
+//! Resident tray, overlapped control pipe and filesystem notifications.
+//! Rendering, indexing and settings live in StepThumbsEngine.exe.
 
 use core::{
     mem::{offset_of, size_of, zeroed},
     ptr::{addr_of_mut, null, null_mut},
     sync::atomic::{AtomicPtr, AtomicU32, Ordering},
 };
+use stepthumbnail_common as common;
+mod shell_pipe;
 use windows_sys::Win32::{
     Foundation::*,
-    Globalization::*,
     Security::*,
     Storage::FileSystem::*,
     System::{
-        Diagnostics::Debug::*, Environment::*, IO::*, JobObjects::*, LibraryLoader::*, Memory::*,
-        Performance::*, Pipes::*, Registry::*, SystemInformation::*, SystemServices::*,
-        Threading::*, WindowsProgramming::*,
+        Diagnostics::Debug::*, IO::*, JobObjects::*, LibraryLoader::*, Memory::*, Performance::*,
+        Pipes::*, Registry::*, SystemInformation::*, SystemServices::*, Threading::*,
+        WindowsProgramming::*,
     },
     UI::{
         HiDpi::*,
@@ -63,8 +46,7 @@ const MAGIC: u64 = 0x53544850;
 const HEADER: usize = 32 * 8;
 const WATCH_BYTES: usize = 16 * 1024;
 const QUEUE_BYTES: usize = 64 * 1024;
-const MAX_ROOTS: usize = 8;
-const MAX_EXCLUDES: usize = 16;
+const MAX_ROOTS: usize = 32;
 const QUIT: u32 = 1;
 const WAKE: u32 = 2;
 const PAUSE: u32 = 4;
@@ -72,6 +54,9 @@ const REFRESH: u32 = 8;
 const READD: u32 = 16;
 const MENU: u32 = 32;
 const CLOSE_MENU: u32 = 64;
+const OPEN_ACTIVITY: u32 = 128;
+const OPEN_CONFIG: u32 = 256;
+const RELOAD_CONFIG: u32 = 512;
 static ACTIONS: AtomicU32 = AtomicU32::new(0);
 static MENU_HANDLE: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(null_mut());
 static MENU_MS: AtomicU32 = AtomicU32::new(80);
@@ -92,7 +77,10 @@ struct Watch {
     file: HANDLE,
     event: HANDLE,
     io: OVERLAPPED,
-    buffer: Block<WATCH_BYTES>,
+    buffer: *mut u8,
+    extended: bool,
+    remote: bool,
+    pending: bool,
 }
 impl Watch {
     const EMPTY: Self = Self {
@@ -100,17 +88,30 @@ impl Watch {
         file: INVALID_HANDLE_VALUE,
         event: null_mut(),
         io: unsafe { zeroed() },
-        buffer: Block([0; WATCH_BYTES]),
+        buffer: null_mut(),
+        extended: true,
+        remote: false,
+        pending: false,
     };
 }
 struct Host {
+    config: Option<common::Config>,
+    bloom: [u8; common::host::BLOOM_BYTES],
+    pending_page: u64,
+    next_page: u64,
+    stopping: bool,
+    quitting: bool,
+    demand: bool,
+    cleanup_demand: bool,
+    force_cold: bool,
+    shutdown_at: u64,
+    restart_at: u64,
+    crash_count: usize,
     window: HWND,
     icon: HICON,
     roots: usize,
-    excludes: usize,
     pool: [u16; 4096],
     pool_used: usize,
-    exclude: [Text; MAX_EXCLUDES],
     watch: [Watch; MAX_ROOTS],
     scratch: [u16; 32768],
     pipe: HANDLE,
@@ -139,11 +140,7 @@ struct Host {
     ready: HANDLE,
     worker_pid: u32,
     worker_since: i64,
-    worker_idle: u32,
-    executable: Text,
-    engine: Text,
     no_tray: bool,
-    no_watch: bool,
     pid: u32,
     frequency: i64,
     batches: u64,
@@ -164,13 +161,23 @@ struct Host {
     watch_errors: u64,
 }
 static mut HOST: Host = Host {
+    config: None,
+    bloom: [0; common::host::BLOOM_BYTES],
+    pending_page: 0,
+    next_page: 0,
+    stopping: false,
+    quitting: false,
+    demand: false,
+    cleanup_demand: false,
+    force_cold: true,
+    shutdown_at: 0,
+    restart_at: 0,
+    crash_count: 0,
     window: null_mut(),
     icon: null_mut(),
     roots: 0,
-    excludes: 0,
     pool: [0; 4096],
     pool_used: 0,
-    exclude: [Text::NONE; MAX_EXCLUDES],
     watch: [const { Watch::EMPTY }; MAX_ROOTS],
     scratch: [0; 32768],
     pipe: INVALID_HANDLE_VALUE,
@@ -199,11 +206,7 @@ static mut HOST: Host = Host {
     ready: null_mut(),
     worker_pid: 0,
     worker_since: 0,
-    worker_idle: 60000,
-    executable: Text::NONE,
-    engine: Text::NONE,
     no_tray: false,
-    no_watch: false,
     pid: 0,
     frequency: 1,
     batches: 0,
@@ -225,22 +228,6 @@ static mut HOST: Host = Host {
 };
 unsafe fn state() -> &'static mut Host {
     &mut *addr_of_mut!(HOST)
-}
-unsafe fn length(p: *const u16) -> usize {
-    let mut n = 0;
-    while n < 32768 && *p.add(n) != 0 {
-        n += 1;
-    }
-    n
-}
-unsafe fn equals(p: *const u16, s: &str) -> bool {
-    let b = s.as_bytes();
-    for (i, v) in b.iter().enumerate() {
-        if *p.add(i) != *v as u16 {
-            return false;
-        }
-    }
-    *p.add(b.len()) == 0
 }
 unsafe fn copy_text(s: &mut Host, p: *const u16, n: usize) -> Text {
     if s.pool_used + n + 1 > s.pool.len() {
@@ -298,165 +285,35 @@ unsafe fn name(buf: *mut u16, prefix: &str, pid: u32, suffix: &str) {
     *buf.add(n) = 0;
 }
 
-// Windows CRT quoting rules, without CommandLineToArgvW/Shell32 or an allocator.
-unsafe fn argument(line: *const u16, position: &mut usize, out: *mut u16) -> bool {
-    while *line.add(*position) == 32 || *line.add(*position) == 9 {
-        *position += 1;
-    }
-    if *line.add(*position) == 0 {
-        return false;
-    }
-    let mut quoted = false;
-    let mut n = 0;
-    loop {
-        let c = *line.add(*position);
-        if c == 0 || (!quoted && (c == 32 || c == 9)) {
-            break;
+unsafe fn configure(s: &mut Host) {
+    s.config = Some(match common::Config::load() {
+        Ok(v) => v,
+        Err(e) => {
+            MessageBoxW(
+                null_mut(),
+                common::wide(format!("Settings could not be loaded: {e:#}")).as_ptr(),
+                w!("StepThumbs"),
+                MB_OK | MB_ICONERROR,
+            );
+            fatal(2)
         }
-        if c == 92 {
-            let mut slashes = 0;
-            while *line.add(*position) == 92 {
-                slashes += 1;
-                *position += 1;
-            }
-            if *line.add(*position) == 34 {
-                for _ in 0..slashes / 2 {
-                    *out.add(n) = 92;
-                    n += 1;
-                }
-                if slashes % 2 == 1 {
-                    *out.add(n) = 34;
-                    n += 1;
-                } else {
-                    quoted = !quoted;
-                }
-                *position += 1;
-            } else {
-                for _ in 0..slashes {
-                    *out.add(n) = 92;
-                    n += 1;
-                }
-            }
-        } else if c == 34 {
-            quoted = !quoted;
-            *position += 1;
-        } else {
-            *out.add(n) = c;
-            n += 1;
-            *position += 1;
-        }
-        if n >= 32767 {
+    });
+    s.bloom = std::fs::read(common::data_dir().join("host-directories.bin"))
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .unwrap_or([0; common::host::BLOOM_BYTES]);
+    let paths = common::host::watch_roots(s.config.as_ref().unwrap());
+    for path in paths {
+        if s.roots == MAX_ROOTS {
             fatal(2);
         }
+        let wide = common::wide(path);
+        let path = copy_text(s, wide.as_ptr(), wide.len() - 1);
+        s.watch[s.roots].path = path;
+        s.roots += 1;
     }
-    *out.add(n) = 0;
-    true
-}
-unsafe fn number(p: *const u16) -> u32 {
-    let mut n = 0u32;
-    let mut i = 0;
-    while *p.add(i) != 0 {
-        let v = *p.add(i);
-        if !(48..=57).contains(&v) {
-            fatal(2);
-        }
-        n = n
-            .checked_mul(10)
-            .and_then(|n| n.checked_add((v - 48) as u32))
-            .unwrap_or_else(|| fatal(2));
-        i += 1;
-    }
-    n
-}
-unsafe fn configure(s: &mut Host) -> Option<(u32, u32)> {
-    let line = GetCommandLineW();
-    let mut at = 0;
-    argument(line, &mut at, s.scratch.as_mut_ptr());
-    while argument(line, &mut at, s.scratch.as_mut_ptr()) {
-        let p = s.scratch.as_ptr();
-        if equals(p, "--worker-stub") {
-            if !argument(line, &mut at, s.scratch.as_mut_ptr()) {
-                fatal(2);
-            }
-            let owner = number(s.scratch.as_ptr());
-            if !argument(line, &mut at, s.scratch.as_mut_ptr()) {
-                fatal(2);
-            }
-            return Some((owner, number(s.scratch.as_ptr())));
-        }
-        let kind = if equals(p, "--watch") {
-            1
-        } else if equals(p, "--exclude") {
-            2
-        } else if equals(p, "--engine-command") {
-            3
-        } else if equals(p, "--worker-idle-ms") {
-            4
-        } else {
-            0
-        };
-        if kind != 0 {
-            if !argument(line, &mut at, s.scratch.as_mut_ptr()) {
-                fatal(2);
-            }
-            if kind == 4 {
-                s.worker_idle = number(s.scratch.as_ptr()).clamp(100, 600000);
-                continue;
-            }
-            let t = copy_text(s, s.scratch.as_ptr(), length(s.scratch.as_ptr()));
-            match kind {
-                1 => {
-                    if s.roots == MAX_ROOTS {
-                        fatal(2);
-                    }
-                    s.watch[s.roots].path = t;
-                    s.roots += 1;
-                }
-                2 => {
-                    if s.excludes == MAX_EXCLUDES {
-                        fatal(2);
-                    }
-                    s.exclude[s.excludes] = t;
-                    s.excludes += 1;
-                }
-                _ => s.engine = t,
-            };
-        } else if equals(p, "--no-auto") {
-            AUTO.store(0, Ordering::Relaxed);
-        } else if equals(p, "--no-tray") {
-            s.no_tray = true;
-        } else if equals(p, "--no-watch") {
-            s.no_watch = true;
-        } else {
-            fatal(2);
-        }
-    }
-    if s.roots == 0 && !s.no_watch {
-        let drives = GetLogicalDrives();
-        for drive in 0..26 {
-            if drives & (1 << drive) == 0 {
-                continue;
-            }
-            let root = [65 + drive as u16, 58, 92, 0];
-            if GetDriveTypeW(root.as_ptr()) == DRIVE_FIXED {
-                let t = copy_text(s, root.as_ptr(), 3);
-                s.watch[s.roots].path = t;
-                s.roots += 1;
-                if s.roots == MAX_ROOTS {
-                    break;
-                }
-            }
-        }
-    }
-    let n = GetModuleFileNameW(null_mut(), s.scratch.as_mut_ptr(), s.scratch.len() as u32) as usize;
-    if n == 0 || n >= s.scratch.len() {
-        fatal(3);
-    }
-    s.executable = copy_text(s, s.scratch.as_ptr(), n);
-    None
 }
 
-#[cfg(not(feature = "resident-shell"))]
 type Notify = unsafe extern "system" fn(u32, *const NOTIFYICONDATAW) -> BOOL;
 unsafe fn notify(s: &Host, action: u32) {
     if s.no_tray {
@@ -469,15 +326,10 @@ unsafe fn notify(s: &Host, action: u32) {
     data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     data.uCallbackMessage = WM_APP + 1;
     data.hIcon = s.icon;
-    let tip = b"StepThumbs Host Prototype";
+    let tip = b"StepThumbs";
     for (i, b) in tip.iter().enumerate() {
         data.szTip[i] = *b as u16;
     }
-    #[cfg(feature = "resident-shell")]
-    {
-        windows_sys::Win32::UI::Shell::Shell_NotifyIconW(action, &data);
-    }
-    #[cfg(not(feature = "resident-shell"))]
     {
         let module = LoadLibraryExW(w!("shell32.dll"), null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32);
         if !module.is_null() {
@@ -491,9 +343,6 @@ unsafe fn notify(s: &Host, action: u32) {
 }
 macro_rules! image_bytes {
     ($theme:literal,$size:literal) => {{
-        #[cfg(feature = "png-icon")]
-        const B: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", $theme, "-", $size, ".png"));
-        #[cfg(not(feature = "png-icon"))]
         const B: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", $theme, "-", $size, ".dib"));
         B
     }};
@@ -552,20 +401,21 @@ unsafe fn menu(window: HWND, test: bool) {
     };
     // Keep the I/O event loop running while the native tray menu is open.
     SetMenuInfo(menu, &info);
-    AppendMenuW(menu, MF_STRING, 10, w!("Wake worker (prototype)"));
-    AppendMenuW(menu, MF_STRING, 11, w!("Configure (prototype worker)"));
+    AppendMenuW(menu, MF_STRING, 10, w!("Activity"));
+    AppendMenuW(menu, MF_STRING, 11, w!("Configure"));
     AppendMenuW(
         menu,
         MF_STRING,
         12,
         if AUTO.load(Ordering::Relaxed) != 0 {
-            w!("Pause filesystem work")
+            w!("Pause preflight")
         } else {
-            w!("Resume filesystem work")
+            w!("Resume preflight")
         },
     );
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
-    AppendMenuW(menu, MF_STRING, 13, w!("Exit prototype"));
+    AppendMenuW(menu, MF_STRING, 14, w!("Open log"));
+    AppendMenuW(menu, MF_STRING, 13, w!("Exit"));
     let mut p: POINT = zeroed();
     GetCursorPos(&mut p);
     SetForegroundWindow(window);
@@ -586,7 +436,7 @@ unsafe extern "system" fn window(window: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             if lp as u32 == WM_RBUTTONUP {
                 menu(window, false);
             } else if lp as u32 == WM_LBUTTONUP {
-                ACTIONS.fetch_or(WAKE, Ordering::Relaxed);
+                ACTIONS.fetch_or(OPEN_ACTIVITY, Ordering::Relaxed);
             }
             0
         }
@@ -607,7 +457,17 @@ unsafe extern "system" fn window(window: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         WM_COMMAND => {
             ACTIONS.fetch_or(
                 match wp as u32 & 0xffff {
-                    10 | 11 => WAKE,
+                    10 => OPEN_ACTIVITY,
+                    11 => OPEN_CONFIG,
+                    14 => {
+                        use std::os::windows::process::CommandExt;
+                        std::process::Command::new("explorer.exe")
+                            .arg(common::data_dir().join("activity.log"))
+                            .creation_flags(CREATE_NO_WINDOW)
+                            .spawn()
+                            .ok();
+                        0
+                    }
                     12 => PAUSE,
                     13 => QUIT,
                     _ => 0,
@@ -666,13 +526,7 @@ unsafe fn open_pipe(s: &mut Host) {
         lpSecurityDescriptor: (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(),
         bInheritHandle: 0,
     };
-    let mut pipe_name = [0u16; 96];
-    name(
-        pipe_name.as_mut_ptr(),
-        "\\\\.\\pipe\\StepThumbs.HostProbe.",
-        s.pid,
-        "",
-    );
+    let pipe_name = common::wide(common::host::pipe_name());
     s.pipe = CreateNamedPipeW(
         pipe_name.as_ptr(),
         PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
@@ -801,12 +655,8 @@ unsafe fn clear_queue(s: &mut Host) {
     s.dirty = 0;
 }
 unsafe fn snapshot(s: &mut Host, error: u64, payload: usize) {
-    let flags = (AUTO.load(Ordering::Relaxed) as u64)
-        | (((!s.worker.is_null()) as u64) << 1)
-        | ((cfg!(feature = "std") as u64) << 2)
-        | ((cfg!(feature = "resident-shell") as u64) << 3)
-        | ((cfg!(feature = "png-icon") as u64) << 4)
-        | ((cfg!(feature = "segment-heap") as u64) << 5);
+    let flags =
+        (AUTO.load(Ordering::Relaxed) as u64) | (((!s.worker.is_null()) as u64) << 1) | (1 << 2); // Standard-library host; retained for the diagnostic protocol.
     s.reply = [
         MAGIC,
         1,
@@ -836,7 +686,7 @@ unsafe fn snapshot(s: &mut Host, error: u64, payload: usize) {
         HEADER as u64,
         payload as u64,
         WATCH_BYTES as u64,
-        (!MENU_HANDLE.load(Ordering::Relaxed).is_null()) as u64,
+        s.pending_page,
         s.ack,
         s.watch_errors,
         s.peak_queue,
@@ -859,6 +709,7 @@ unsafe fn reply(s: &mut Host) {
             5 => {
                 if arg == s.generation {
                     clear_queue(s);
+                    s.pending_page = 0;
                     s.ack = arg;
                 } else {
                     error = 2;
@@ -869,6 +720,11 @@ unsafe fn reply(s: &mut Host) {
             }
             6 => {
                 AUTO.fetch_xor(1, Ordering::Relaxed);
+                if AUTO.load(Ordering::Relaxed) != 0 {
+                    launch(s);
+                } else if !s.wake.is_null() {
+                    SetEvent(s.wake);
+                }
             }
             7 => {
                 if !s.worker.is_null() {
@@ -885,6 +741,28 @@ unsafe fn reply(s: &mut Host) {
                     Ordering::Relaxed,
                 );
                 ACTIONS.fetch_or(MENU, Ordering::Relaxed);
+            }
+            9 => queue_page(s, 1),
+            10 => queue_page(s, 3),
+            11 => {
+                if arg == s.worker_pid as u64
+                    && s.queue_count == 0
+                    && s.dirty == 0
+                    && s.pending_page == 0
+                    && !s.quitting
+                {
+                    s.stopping = true;
+                } else {
+                    error = 4;
+                }
+            }
+            13 => {
+                ACTIONS.fetch_or(RELOAD_CONFIG, Ordering::Relaxed);
+            }
+            12 => {
+                s.next_page = arg;
+                s.demand = true;
+                ACTIONS.fetch_or(RELOAD_CONFIG, Ordering::Relaxed);
             }
             _ => error = 3,
         }
@@ -955,24 +833,72 @@ unsafe fn pipe_event(s: &mut Host) {
     }
 }
 
-unsafe fn arm(w: &mut Watch) {
+unsafe fn arm(w: &mut Watch) -> bool {
     ResetEvent(w.event);
     w.io = zeroed();
     w.io.hEvent = w.event;
-    if ReadDirectoryChangesExW(
-        w.file,
-        w.buffer.0.as_mut_ptr().cast(),
-        WATCH_BYTES as u32,
-        1,
-        FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE,
-        null_mut(),
-        &mut w.io,
-        None,
-        ReadDirectoryNotifyExtendedInformation,
-    ) == 0
+    let filter = FILE_NOTIFY_CHANGE_FILE_NAME
+        | FILE_NOTIFY_CHANGE_DIR_NAME
+        | FILE_NOTIFY_CHANGE_LAST_WRITE
+        | FILE_NOTIFY_CHANGE_SIZE;
+    let mut ok = if w.extended {
+        ReadDirectoryChangesExW(
+            w.file,
+            w.buffer.cast(),
+            WATCH_BYTES as u32,
+            1,
+            filter,
+            null_mut(),
+            &mut w.io,
+            None,
+            ReadDirectoryNotifyExtendedInformation,
+        )
+    } else {
+        0
+    };
+    if ok == 0
+        && w.extended
+        && matches!(
+            GetLastError(),
+            ERROR_INVALID_PARAMETER | ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED
+        )
     {
-        fatal(6);
+        w.extended = false;
     }
+    if !w.extended {
+        ok = ReadDirectoryChangesW(
+            w.file,
+            w.buffer.cast(),
+            WATCH_BYTES as u32,
+            1,
+            filter,
+            null_mut(),
+            &mut w.io,
+            None,
+        );
+    }
+    w.pending = ok != 0;
+    w.pending
+}
+unsafe fn stop_watch(w: &mut Watch) {
+    if w.file != INVALID_HANDLE_VALUE {
+        if w.pending {
+            CancelIoEx(w.file, &w.io);
+            let mut n = 0;
+            GetOverlappedResult(w.file, &w.io, &mut n, 1);
+        }
+        CloseHandle(w.file);
+        w.file = INVALID_HANDLE_VALUE;
+    }
+    if !w.event.is_null() {
+        CloseHandle(w.event);
+        w.event = null_mut();
+    }
+    if !w.buffer.is_null() {
+        VirtualFree(w.buffer.cast(), 0, MEM_RELEASE);
+        w.buffer = null_mut();
+    }
+    w.pending = false;
 }
 unsafe fn setup_watches(s: &mut Host) {
     for i in 0..s.roots {
@@ -987,29 +913,85 @@ unsafe fn setup_watches(s: &mut Host) {
             null_mut(),
         );
         if file == INVALID_HANDLE_VALUE {
-            fatal(6);
+            s.watch_errors += 1;
+            continue;
         }
         let event = CreateEventW(null(), 1, 0, null());
-        if event.is_null() {
+        let buffer: *mut u8 = VirtualAlloc(
+            null(),
+            WATCH_BYTES,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        )
+        .cast();
+        if event.is_null() || buffer.is_null() {
             fatal(6);
         }
         s.watch[i].file = file;
         s.watch[i].event = event;
-        arm(&mut s.watch[i]);
+        s.watch[i].buffer = buffer;
+        s.watch[i].remote = GetDriveTypeW(path) == DRIVE_REMOTE;
+        if !arm(&mut s.watch[i]) {
+            s.watch_errors += 1;
+            stop_watch(&mut s.watch[i]);
+        }
     }
 }
-unsafe fn excluded(s: &Host, path: *const u16, len: usize) -> bool {
-    for t in &s.exclude[..s.excludes] {
-        if t.len > len {
-            continue;
-        }
-        if CompareStringOrdinal(path, t.len as i32, text(s, *t), t.len as i32, 1) == CSTR_EQUAL
-            && (t.len == len || *path.add(t.len) == 92 || *text(s, *t).add(t.len - 1) == 92)
-        {
-            return true;
+unsafe fn queue_page(s: &mut Host, page: u64) {
+    if s.quitting {
+        return;
+    }
+    s.pending_page = page;
+    s.generation = s.generation.wrapping_add(1);
+    launch(s);
+}
+unsafe fn reload_config(s: &mut Host) {
+    if let Ok(bits) = std::fs::read(common::data_dir().join("host-directories.bin")) {
+        if let Ok(bits) = bits.try_into() {
+            s.bloom = bits;
         }
     }
-    false
+    let Ok(config) = common::Config::load() else {
+        return;
+    };
+    let changed = s
+        .config
+        .as_ref()
+        .is_none_or(|old| serde_json::to_vec(old).ok() != serde_json::to_vec(&config).ok());
+    let roots = common::host::watch_roots(&config);
+    let roots_changed = roots.len() != s.roots
+        || roots.iter().enumerate().any(|(i, p)| {
+            let old = String::from_utf16_lossy(core::slice::from_raw_parts(
+                text(s, s.watch[i].path),
+                s.watch[i].path.len,
+            ));
+            !std::path::Path::new(&old).eq(p)
+        });
+    s.config = Some(config);
+    if roots_changed {
+        for watch in &mut s.watch[..s.roots] {
+            stop_watch(watch);
+        }
+        s.roots = 0;
+        s.pool_used = 0;
+        configure(s);
+        setup_watches(s);
+        s.dirty = (1u64 << s.roots) - 1;
+        s.generation = s.generation.wrapping_add(1);
+        if s.worker.is_null() {
+            if AUTO.load(Ordering::Relaxed) != 0 {
+                launch(s);
+            }
+        } else {
+            SetEvent(s.wake);
+        }
+    }
+    if !changed {
+        return;
+    }
+    if s.worker.is_null() {
+        launch(s);
+    }
 }
 unsafe fn model(path: *const u16, len: usize) -> bool {
     for suffix in [b".step" as &[u8], b".stp", b".stl", b".glb"] {
@@ -1070,30 +1052,49 @@ unsafe fn enqueue(s: &mut Host, root: usize, path: *const u16, len: usize, kind:
     s.peak_queue = s.peak_queue.max(s.queue_len as u64);
 }
 unsafe fn watch_event(s: &mut Host, index: usize) -> bool {
+    s.batches += 1;
     let mut bytes = 0;
     let w = &mut s.watch[index];
-    s.batches += 1;
     let good = GetOverlappedResult(w.file, &w.io, &mut bytes, 0) != 0;
+    w.pending = false;
     if !good || bytes == 0 {
+        s.cleanup_demand = true;
         s.overflows += 1;
         s.dirty |= 1 << index;
-        s.generation += 1;
-        arm(w);
+        s.generation = s.generation.wrapping_add(1);
+        if !arm(w) {
+            s.watch_errors += 1;
+            stop_watch(w);
+        }
         return true;
     }
-    let base = w.buffer.0.as_ptr();
+    let base = w.buffer;
+    let extended = w.extended;
+    let remote = w.remote;
     let count = bytes as usize;
     let mut at = 0;
     let mut work = false;
-    let header = offset_of!(FILE_NOTIFY_EXTENDED_INFORMATION, FileName);
+    let header = if extended {
+        offset_of!(FILE_NOTIFY_EXTENDED_INFORMATION, FileName)
+    } else {
+        12
+    };
     let root = s.watch[index].path;
     while at + header <= count {
         let p = base.add(at);
         let field = |offset| core::ptr::read_unaligned(p.add(offset).cast::<u32>());
         let next = field(0) as usize;
         let action = field(4);
-        let attributes = field(offset_of!(FILE_NOTIFY_EXTENDED_INFORMATION, FileAttributes));
-        let len = field(offset_of!(FILE_NOTIFY_EXTENDED_INFORMATION, FileNameLength)) as usize;
+        let attributes = if extended {
+            field(offset_of!(FILE_NOTIFY_EXTENDED_INFORMATION, FileAttributes))
+        } else {
+            0
+        };
+        let len = field(if extended {
+            offset_of!(FILE_NOTIFY_EXTENDED_INFORMATION, FileNameLength)
+        } else {
+            8
+        }) as usize;
         if !len.is_multiple_of(2) || at + header + len > count {
             s.overflows += 1;
             s.dirty |= 1 << index;
@@ -1104,17 +1105,28 @@ unsafe fn watch_event(s: &mut Host, index: usize) -> bool {
         s.records += 1;
         let file = p.add(header).cast::<u16>();
         let n = len / 2;
-        let directory = attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
-        // Child changes already have their own records. A directory's last-write
-        // notification must not wake an engine or trigger a subtree scan.
-        if (directory && action == FILE_ACTION_MODIFIED) || (!directory && !model(file, n)) {
-            s.ignored += 1;
-        } else {
-            let separator = if *text(s, root).add(root.len - 1) == 92 {
-                0
-            } else {
-                1
-            };
+        let is_model = model(file, n);
+        let deleted = matches!(action, FILE_ACTION_REMOVED | FILE_ACTION_RENAMED_OLD_NAME);
+        let special = [
+            b"settings.json" as &[u8],
+            b"host-directories.bin",
+            b"host-extra-roots.json",
+        ]
+        .iter()
+        .any(|suffix| {
+            n >= suffix.len()
+                && suffix
+                    .iter()
+                    .enumerate()
+                    .all(|(i, b)| lower(*file.add(n - suffix.len() + i)) == *b as u16)
+        });
+        let candidate = (attributes & FILE_ATTRIBUTE_DIRECTORY != 0
+            && action != FILE_ACTION_MODIFIED)
+            || is_model
+            || special
+            || !extended && action != FILE_ACTION_MODIFIED;
+        if candidate {
+            let separator = usize::from(*text(s, root).add(root.len - 1) != 92);
             let total = root.len + separator + n;
             if total + 1 > s.scratch.len() {
                 s.dirty |= 1 << index;
@@ -1128,53 +1140,110 @@ unsafe fn watch_event(s: &mut Host, index: usize) -> bool {
                 }
                 core::ptr::copy_nonoverlapping(file, dest.add(root.len + separator), n);
                 *dest.add(total) = 0;
-                if excluded(s, dest, total) {
-                    s.ignored += 1;
+                let path = std::path::PathBuf::from(String::from_utf16_lossy(
+                    core::slice::from_raw_parts(dest, total),
+                ));
+                let key = common::path_key(&path);
+                let data = common::data_dir();
+                let tracked = !s.worker.is_null() || common::host::bloom_contains(&s.bloom, &key);
+                let directory = if extended {
+                    attributes & FILE_ATTRIBUTE_DIRECTORY != 0
+                } else if deleted {
+                    !is_model && tracked
                 } else {
+                    GetFileAttributesW(dest) & FILE_ATTRIBUTE_DIRECTORY != 0
+                };
+                let cfg = s.config.as_ref().unwrap();
+                let wanted = if common::below(&path, &data) {
+                    if path == data.join("settings.json")
+                        || path == data.join("host-directories.bin")
+                        || path == data.join("host-extra-roots.json")
+                    {
+                        ACTIONS.fetch_or(RELOAD_CONFIG, Ordering::Relaxed);
+                    }
+                    false
+                } else if directory {
+                    if deleted {
+                        tracked
+                    } else {
+                        cfg.included(&path)
+                            && (action == FILE_ACTION_RENAMED_NEW_NAME
+                                || remote && action == FILE_ACTION_ADDED)
+                    }
+                } else if is_model {
+                    if deleted {
+                        tracked
+                    } else {
+                        cfg.included(&path) && cfg.supports(&path)
+                    }
+                } else {
+                    false
+                };
+                if wanted {
+                    if deleted {
+                        s.cleanup_demand = true;
+                    }
                     if directory {
                         s.directories += 1;
                     } else {
                         s.models += 1;
                     }
-                    enqueue(s, index, dest, total, if directory { action } else { 0 });
+                    enqueue(s, index, dest, total, u32::from(directory));
                     work = true;
+                } else {
+                    s.ignored += 1;
                 }
             }
+        } else {
+            s.ignored += 1;
         }
         if next == 0 {
             break;
         }
         if next < header + len || at + next > count {
             s.dirty |= 1 << index;
-            s.generation = s.generation.wrapping_add(1);
             s.overflows += 1;
+            s.generation = s.generation.wrapping_add(1);
             work = true;
             break;
         }
         at += next;
     }
-    arm(&mut s.watch[index]);
+    if !arm(&mut s.watch[index]) {
+        s.watch_errors += 1;
+        stop_watch(&mut s.watch[index]);
+    }
     work
 }
-
 unsafe fn launch(s: &mut Host) {
+    if s.quitting {
+        return;
+    }
     if !s.worker.is_null() {
+        if s.stopping {
+            s.demand = true;
+            return;
+        }
         if !s.wake.is_null() {
             SetEvent(s.wake);
         }
         return;
     }
+    if s.restart_at > GetTickCount64() {
+        return;
+    }
+    s.restart_at = 0;
     let mut event_name = [0u16; 96];
     name(
         event_name.as_mut_ptr(),
-        "Local\\StepThumbs.HostProbe.",
+        "Local\\StepThumbs.Host.",
         s.pid,
         ".wake",
     );
     s.wake = CreateEventW(null(), 0, 1, event_name.as_ptr());
     name(
         event_name.as_mut_ptr(),
-        "Local\\StepThumbs.HostProbe.",
+        "Local\\StepThumbs.Host.",
         s.pid,
         ".ready",
     );
@@ -1197,35 +1266,25 @@ unsafe fn launch(s: &mut Host) {
     {
         fatal(7);
     }
-    if s.engine.len != 0 {
-        core::ptr::copy_nonoverlapping(text(s, s.engine), s.scratch.as_mut_ptr(), s.engine.len + 1);
-    } else {
-        let mut n = 0;
-        *s.scratch.as_mut_ptr().add(n) = 34;
-        n += 1;
-        core::ptr::copy_nonoverlapping(
-            text(s, s.executable),
-            s.scratch.as_mut_ptr().add(n),
-            s.executable.len,
-        );
-        n += s.executable.len;
-        *s.scratch.as_mut_ptr().add(n) = 34;
-        n += 1;
-        for b in b" --worker-stub " {
-            *s.scratch.as_mut_ptr().add(n) = *b as u16;
-            n += 1;
-        }
-        name(s.scratch.as_mut_ptr().add(n), "", s.pid, " ");
-        n = length(s.scratch.as_ptr());
-        name(s.scratch.as_mut_ptr().add(n), "", s.worker_idle, "");
-    }
+    let executable = std::env::current_exe()
+        .unwrap()
+        .with_file_name("StepThumbsEngine.exe");
+    let mut command = common::wide(format!(
+        "\"{}\" --engine {} {}",
+        executable.display(),
+        s.pid,
+        u8::from(s.force_cold)
+    ));
+    s.force_cold = false;
+    s.stopping = false;
+    s.demand = false;
     let mut startup: STARTUPINFOW = zeroed();
     startup.cb = size_of::<STARTUPINFOW>() as u32;
     let mut process: PROCESS_INFORMATION = zeroed();
     let start = ticks();
     if CreateProcessW(
         null(),
-        s.scratch.as_mut_ptr(),
+        command.as_mut_ptr(),
         null(),
         null(),
         0,
@@ -1250,10 +1309,6 @@ unsafe fn launch(s: &mut Host) {
     s.launches += 1;
     ResumeThread(process.hThread);
     CloseHandle(process.hThread);
-    if s.engine.len != 0 {
-        CloseHandle(s.ready);
-        s.ready = null_mut();
-    }
 }
 unsafe fn worker_exit(s: &mut Host) {
     GetExitCodeProcess(s.worker, &mut s.exit_code);
@@ -1269,90 +1324,33 @@ unsafe fn worker_exit(s: &mut Host) {
     s.ready = null_mut();
     s.worker_pid = 0;
     s.exits += 1;
-}
-
-unsafe fn request(owner: u32, op: u32, arg: u64, header: &mut [u64; 32]) -> bool {
-    let mut pipe_name = [0u16; 96];
-    name(
-        pipe_name.as_mut_ptr(),
-        "\\\\.\\pipe\\StepThumbs.HostProbe.",
-        owner,
-        "",
-    );
-    WaitNamedPipeW(pipe_name.as_ptr(), 2000);
-    let pipe = CreateFileW(
-        pipe_name.as_ptr(),
-        GENERIC_READ | GENERIC_WRITE,
-        0,
-        null(),
-        OPEN_EXISTING,
-        0,
-        null_mut(),
-    );
-    if pipe == INVALID_HANDLE_VALUE {
-        return false;
+    s.stopping = false;
+    if s.exit_code != 0 {
+        s.force_cold = true;
+        s.demand = true;
+        s.restart_at = GetTickCount64() + [1000, 2000, 5000, 15000, 30000][s.crash_count.min(4)];
+        s.crash_count = s.crash_count.saturating_add(1);
+    } else {
+        s.crash_count = 0;
+        s.restart_at = 0;
     }
-    let command = [MAGIC | ((op as u64) << 32), arg];
-    let mut n = 0;
-    let mut ok = WriteFile(pipe, command.as_ptr().cast(), 16, &mut n, null_mut()) != 0 && n == 16;
-    let mut filled = 0;
-    while ok && filled < HEADER {
-        ok = ReadFile(
-            pipe,
-            (header.as_mut_ptr() as *mut u8).add(filled),
-            (HEADER - filled) as u32,
-            &mut n,
-            null_mut(),
-        ) != 0
-            && n > 0;
-        filled += n as usize;
-    }
-    if ok {
-        let mut left = header[26] as usize;
-        let mut buffer = [0u8; 256];
-        while left > 0 {
-            let bytes = left.min(buffer.len());
-            if ReadFile(pipe, buffer.as_mut_ptr(), bytes as u32, &mut n, null_mut()) == 0 || n == 0
-            {
-                ok = false;
-                break;
-            }
-            left -= n as usize;
+    if let Ok(bits) = std::fs::read(common::data_dir().join("host-directories.bin")) {
+        if let Ok(bits) = bits.try_into() {
+            s.bloom = bits;
         }
     }
-    CloseHandle(pipe);
-    ok && header[0] == MAGIC
-}
-unsafe fn stub(owner: u32, idle: u32) -> u32 {
-    let mut event = [0u16; 96];
-    name(
-        event.as_mut_ptr(),
-        "Local\\StepThumbs.HostProbe.",
-        owner,
-        ".wake",
-    );
-    let wake = OpenEventW(SYNCHRONIZE, 0, event.as_ptr());
-    name(
-        event.as_mut_ptr(),
-        "Local\\StepThumbs.HostProbe.",
-        owner,
-        ".ready",
-    );
-    let ready = OpenEventW(EVENT_MODIFY_STATE, 0, event.as_ptr());
-    if wake.is_null() || ready.is_null() {
-        return 8;
+    if s.next_page != 0 {
+        s.pending_page = s.next_page;
+        s.next_page = 0;
+        s.generation = s.generation.wrapping_add(1);
     }
-    SetEvent(ready);
-    CloseHandle(ready);
-    let mut header = [0u64; 32];
-    while WaitForSingleObject(wake, idle) == WAIT_OBJECT_0 {
-        if request(owner, 4, 0, &mut header) {
-            let generation = header[15];
-            request(owner, 5, generation, &mut header);
-        }
+    if !s.quitting
+        && (s.demand
+            || s.pending_page != 0
+            || AUTO.load(Ordering::Relaxed) != 0 && (s.queue_count != 0 || s.dirty != 0))
+    {
+        launch(s);
     }
-    CloseHandle(wake);
-    0
 }
 
 unsafe fn cleanup(s: &mut Host) {
@@ -1376,13 +1374,7 @@ unsafe fn cleanup(s: &mut Host) {
     }
     free_reply(s);
     for w in &mut s.watch[..s.roots] {
-        if w.file != INVALID_HANDLE_VALUE {
-            CancelIoEx(w.file, &w.io);
-            let mut n = 0;
-            GetOverlappedResult(w.file, &w.io, &mut n, 1);
-            CloseHandle(w.file);
-            CloseHandle(w.event);
-        }
+        stop_watch(w);
     }
     clear_queue(s);
     if !s.job.is_null() {
@@ -1397,11 +1389,11 @@ unsafe fn cleanup(s: &mut Host) {
 }
 unsafe fn main_host() -> u32 {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+    // Keep the counter alive while the engine sleeps. DLL hits only increment
+    // shared memory; they never send a message or wake this process.
+    let _stats = common::shared_stats::SharedStats::create();
     let s = state();
-    if let Some((owner, idle)) = configure(s) {
-        return stub(owner, idle);
-    }
-    #[cfg(feature = "disable-ime")]
+    configure(s);
     {
         // The host has no text entry. Settings live in the engine process.
         let module = LoadLibraryExW(w!("imm32.dll"), null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -1420,7 +1412,7 @@ unsafe fn main_host() -> u32 {
     let class = WNDCLASSW {
         lpfnWndProc: Some(window),
         hInstance: instance,
-        lpszClassName: w!("StepThumbsHostPrototype"),
+        lpszClassName: w!("StepThumbsHostWindow"),
         ..zeroed()
     };
     if RegisterClassW(&class) == 0 {
@@ -1428,8 +1420,8 @@ unsafe fn main_host() -> u32 {
     }
     s.window = CreateWindowExW(
         WS_EX_TOOLWINDOW,
-        w!("StepThumbsHostPrototype"),
-        w!("StepThumbs Host Prototype"),
+        w!("StepThumbsHostWindow"),
+        w!("StepThumbs"),
         WS_POPUP,
         0,
         0,
@@ -1455,11 +1447,40 @@ unsafe fn main_host() -> u32 {
         notify(s, NIM_ADD);
     }
     open_pipe(s);
+    let mut shell = shell_pipe::Listener::new().unwrap_or_else(|_| fatal(4));
     setup_watches(s);
+    launch(s);
     loop {
+        // Never let a busy volume starve tray messages.
+        let mut message: MSG = zeroed();
+        for _ in 0..32 {
+            if PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) == 0 {
+                break;
+            }
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
         let actions = ACTIONS.swap(0, Ordering::Relaxed);
         if actions & QUIT != 0 {
+            s.quitting = true;
+            s.shutdown_at = GetTickCount64() + 120000;
+            if !s.worker.is_null() {
+                s.pending_page = 255;
+                s.generation = s.generation.wrapping_add(1);
+                SetEvent(s.wake);
+            }
+        }
+        if s.quitting && s.worker.is_null() {
             break;
+        }
+        if actions & OPEN_ACTIVITY != 0 {
+            queue_page(s, 1);
+        }
+        if actions & OPEN_CONFIG != 0 {
+            queue_page(s, 3);
+        }
+        if actions & RELOAD_CONFIG != 0 {
+            reload_config(s);
         }
         if actions & CLOSE_MENU != 0 {
             let menu = MENU_HANDLE.swap(null_mut(), Ordering::Relaxed);
@@ -1469,6 +1490,11 @@ unsafe fn main_host() -> u32 {
         }
         if actions & PAUSE != 0 {
             AUTO.fetch_xor(1, Ordering::Relaxed);
+            if AUTO.load(Ordering::Relaxed) != 0 {
+                launch(s);
+            } else if !s.wake.is_null() {
+                SetEvent(s.wake);
+            }
         }
         if actions & WAKE != 0 {
             launch(s);
@@ -1491,31 +1517,45 @@ unsafe fn main_host() -> u32 {
                 );
             }
         }
-        let mut handles = [null_mut(); 12];
-        let mut kinds = [0u32; 12];
+        let mut handles = [null_mut(); MAX_ROOTS + 5];
+        let mut kinds = [0u32; MAX_ROOTS + 5];
         let mut n = 0;
         handles[n] = s.pipe_event;
         n += 1;
+        handles[n] = shell.event;
+        kinds[n] = 200;
+        n += 1;
         for i in 0..s.roots {
-            handles[n] = s.watch[i].event;
-            kinds[n] = 1 + i as u32;
-            n += 1;
+            if s.watch[i].file != INVALID_HANDLE_VALUE {
+                handles[n] = s.watch[i].event;
+                kinds[n] = 1 + i as u32;
+                n += 1;
+            }
         }
         if !s.worker.is_null() {
             handles[n] = s.worker;
-            kinds[n] = 20;
+            kinds[n] = 100;
             n += 1;
         }
         if !s.ready.is_null() {
             handles[n] = s.ready;
-            kinds[n] = 21;
+            kinds[n] = 101;
             n += 1;
         }
-        let timeout = if s.deadline == 0 {
+        let mut timeout = if s.deadline == 0 {
             INFINITE
         } else {
             s.deadline.saturating_sub(GetTickCount64()).min(3000) as u32
         };
+        if s.quitting {
+            timeout = timeout.min(s.shutdown_at.saturating_sub(GetTickCount64()) as u32);
+        }
+        if shell.deadline != 0 {
+            timeout = timeout.min(shell.deadline.saturating_sub(GetTickCount64()) as u32);
+        }
+        if s.worker.is_null() && s.restart_at != 0 && !s.quitting {
+            timeout = timeout.min(s.restart_at.saturating_sub(GetTickCount64()) as u32);
+        }
         let result = MsgWaitForMultipleObjectsEx(
             n as u32,
             handles.as_ptr(),
@@ -1526,14 +1566,34 @@ unsafe fn main_host() -> u32 {
         s.wakeups += 1;
         let mut work = false;
         if result == WAIT_TIMEOUT {
-            disconnect(s);
+            if !s.quitting
+                && s.worker.is_null()
+                && s.restart_at != 0
+                && GetTickCount64() >= s.restart_at
+            {
+                launch(s);
+            }
+            if shell.expire().is_err() {
+                fatal(4);
+            }
+            if s.quitting && GetTickCount64() >= s.shutdown_at {
+                break;
+            }
+            if s.deadline != 0 && GetTickCount64() >= s.deadline {
+                disconnect(s);
+            }
         } else if result == WAIT_FAILED {
             fatal(9);
         } else if result < n as u32 {
             match kinds[result as usize] {
                 0 => pipe_event(s),
-                20 => worker_exit(s),
-                21 => {
+                100 => worker_exit(s),
+                200 => {
+                    if shell.event().is_err() {
+                        fatal(4);
+                    }
+                }
+                101 => {
                     s.ready_us = micros(s, ticks() - s.worker_since);
                     CloseHandle(s.ready);
                     s.ready = null_mut();
@@ -1547,99 +1607,116 @@ unsafe fn main_host() -> u32 {
                 DispatchMessageW(&msg);
             }
         }
-        if work && AUTO.load(Ordering::Relaxed) != 0 {
+        if work && (AUTO.load(Ordering::Relaxed) != 0 || s.cleanup_demand) {
+            s.cleanup_demand = false;
             launch(s);
         }
     }
+    drop(shell);
     cleanup(s);
     0
 }
 
-#[cfg(feature = "std")]
 fn main() {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let arg = args.first().map(String::as_str).unwrap_or("");
+    let exe = std::env::current_exe().unwrap();
+    if matches!(
+        arg,
+        "--render-test"
+            | "--snapshot"
+            | "--snapshot-filetypes"
+            | "--promotion-test"
+            | "--hooks-self-test"
+            | "--restore-hooks"
+    ) {
+        use std::os::windows::process::CommandExt;
+        let code = std::process::Command::new(exe.with_file_name("StepThumbsEngine.exe"))
+            .args(&args)
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .map(|v| v.code().unwrap_or(1))
+            .unwrap_or(1);
+        std::process::exit(code);
+    }
+    if arg == "--status" {
+        unsafe {
+            windows_sys::Win32::System::Console::AttachConsole(u32::MAX);
+        }
+        match common::ipc::call(&common::ipc::Request::Status, None) {
+            Ok(v) => println!("{}", serde_json::to_string_pretty(&v.status).unwrap()),
+            Err(e) => {
+                eprintln!("{e:#}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    let op = match arg {
+        "--background" => common::host::STATUS,
+        "--wake" => common::host::WAKE,
+        "--shutdown" => common::host::QUIT,
+        "--pause" | "--resume" => common::host::TOGGLE,
+        "--file-types" => common::host::CONFIGURE,
+        _ => common::host::SHOW,
+    };
+    if let Ok((header, _)) = common::host::request(common::host::STATUS, 0) {
+        if (arg == "--pause" && header[4] & 1 == 0) || (arg == "--resume" && header[4] & 1 != 0) {
+            return;
+        }
+        let _ = common::host::request(op, 0);
+        if op == common::host::QUIT {
+            unsafe {
+                let process = OpenProcess(SYNCHRONIZE, 0, header[3] as u32);
+                if !process.is_null() {
+                    WaitForSingleObject(process, 125000);
+                    CloseHandle(process);
+                }
+            }
+        }
+        return;
+    }
+    if arg == "--shutdown" {
+        if common::ipc::exists() {
+            let _ = common::ipc::call(&common::ipc::Request::Shutdown, None);
+        }
+        return;
+    }
     unsafe {
-        ExitProcess(main_host());
-    }
-}
-#[cfg(not(feature = "std"))]
-#[unsafe(no_mangle)]
-/// # Safety
-/// Called once by the Windows executable loader, on the initial process thread.
-pub unsafe extern "system" fn host_entry() -> ! {
-    let code = main_host();
-    ExitProcess(code)
-}
-#[cfg(not(feature = "std"))]
-#[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    unsafe { ExitProcess(101) }
-}
-
-// No CRT: volatile byte operations prevent recursive LLVM memory intrinsics.
-#[cfg(not(feature = "std"))]
-#[unsafe(no_mangle)]
-/// # Safety
-/// `dst` must be writable for `n` bytes, as for the C memory intrinsic.
-pub unsafe extern "C" fn memset(
-    dst: *mut core::ffi::c_void,
-    value: i32,
-    n: usize,
-) -> *mut core::ffi::c_void {
-    let bytes = dst.cast::<u8>();
-    for i in 0..n {
-        bytes.add(i).write_volatile(value as u8);
-    }
-    dst
-}
-#[cfg(not(feature = "std"))]
-#[unsafe(no_mangle)]
-/// # Safety
-/// Both regions must be valid for `n` bytes and must not overlap.
-pub unsafe extern "C" fn memcpy(
-    dst: *mut core::ffi::c_void,
-    src: *const core::ffi::c_void,
-    n: usize,
-) -> *mut core::ffi::c_void {
-    let (out, input) = (dst.cast::<u8>(), src.cast::<u8>());
-    for i in 0..n {
-        out.add(i).write_volatile(input.add(i).read_volatile());
-    }
-    dst
-}
-#[cfg(not(feature = "std"))]
-#[unsafe(no_mangle)]
-/// # Safety
-/// Both regions must be valid for `n` bytes; overlap is permitted.
-pub unsafe extern "C" fn memmove(
-    dst: *mut core::ffi::c_void,
-    src: *const core::ffi::c_void,
-    n: usize,
-) -> *mut core::ffi::c_void {
-    if (dst as usize) < src as usize {
-        memcpy(dst, src, n);
-    } else {
-        let (out, input) = (dst.cast::<u8>(), src.cast::<u8>());
-        for i in (0..n).rev() {
-            out.add(i).write_volatile(input.add(i).read_volatile());
+        let mutex = CreateMutexW(
+            null(),
+            0,
+            common::wide(format!(
+                "Local\\{}",
+                common::host::pipe_name().replace('\\', "_")
+            ))
+            .as_ptr(),
+        );
+        if mutex.is_null() {
+            fatal(2);
         }
-    }
-    dst
-}
-#[cfg(not(feature = "std"))]
-#[unsafe(no_mangle)]
-/// # Safety
-/// Both regions must be readable for `n` bytes.
-pub unsafe extern "C" fn memcmp(
-    a: *const core::ffi::c_void,
-    b: *const core::ffi::c_void,
-    n: usize,
-) -> i32 {
-    let (a, b) = (a.cast::<u8>(), b.cast::<u8>());
-    for i in 0..n {
-        let (a, b) = (a.add(i).read_volatile(), b.add(i).read_volatile());
-        if a != b {
-            return a as i32 - b as i32;
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            let _ = common::host::ensure(op, None);
+            return;
         }
+        // A provider already loaded by Explorer may still use the old public
+        // pipe. Retire its broker before taking over that endpoint.
+        if common::ipc::exists() {
+            let _ = common::ipc::call(&common::ipc::Request::Shutdown, None);
+        }
+        if arg == "--pause" {
+            AUTO.store(0, Ordering::Relaxed);
+        }
+        let s = state();
+        s.pending_page = if op == common::host::SHOW {
+            1
+        } else if op == common::host::CONFIGURE {
+            3
+        } else {
+            0
+        };
+        let result = main_host();
+        CloseHandle(mutex);
+        std::process::exit(result as i32);
     }
-    0
 }

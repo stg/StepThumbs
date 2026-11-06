@@ -36,11 +36,59 @@ enum Event {
     Finished(PathBuf, bool, bool),
     Journal(String),
     Overflow(String),
+    Barrier(mpsc::SyncSender<()>),
     Wake,
     Track(PathBuf),
     Rescan,
     RetryFailed,
     Shutdown(mpsc::SyncSender<()>),
+}
+static READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn ready() -> bool {
+    READY.load(std::sync::atomic::Ordering::Acquire)
+}
+pub fn ingest(payload: &[u8], overflow: u64) -> anyhow::Result<()> {
+    if payload.is_empty() && overflow == 0 {
+        return Ok(());
+    }
+    let tx = NOTIFY.wait();
+    let mut at = 0;
+    while at < payload.len() {
+        anyhow::ensure!(at + 8 <= payload.len(), "Incomplete filesystem record");
+        let size = u32::from_le_bytes(payload[at..at + 4].try_into()?) as usize;
+        anyhow::ensure!(
+            size >= 8 && size.is_multiple_of(2) && at + size <= payload.len(),
+            "Invalid filesystem record"
+        );
+        let kind = u32::from_le_bytes(payload[at + 4..at + 8].try_into()?) >> 16;
+        let words = payload[at + 8..at + size]
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect::<Vec<_>>();
+        let path = PathBuf::from(String::from_utf16(&words)?);
+        let event = if !path.exists() {
+            Event::Deleted(path)
+        } else if kind != 0 || path.is_dir() {
+            Event::Directory(path)
+        } else {
+            Event::File(path, true)
+        };
+        tx.send(event)?;
+        at += size;
+    }
+    if overflow != 0 {
+        let cfg = Config::load()?;
+        for (i, root) in common::host::watch_roots(&cfg).into_iter().enumerate() {
+            if overflow & (1 << i) != 0 {
+                let _ = crate::cache_index::remove_deleted(&root);
+                tx.send(Event::Overflow(volume(&root)))?;
+            }
+        }
+    }
+    let (ack, done) = mpsc::sync_channel(1);
+    tx.send(Event::Barrier(ack))?;
+    done.recv_timeout(Duration::from_secs(30))?;
+    Ok(())
 }
 fn signature(cfg: &Config, extensions: bool) -> String {
     let mut roots = cfg.roots.clone();
@@ -90,6 +138,13 @@ fn eligible(cfg: &Config, path: &Path) -> bool {
         && cfg.supports(path)
         && fs::symlink_metadata(path)
             .is_ok_and(|m| m.is_file() && m.file_attributes() & (0x400 | 0x1000) == 0)
+}
+fn checkpoint_path_valid(cfg: &Config, path: &Path) -> bool {
+    if crate::runtime::enabled() && !crate::runtime::cold() {
+        cfg.included(path) && cfg.supports(path)
+    } else {
+        eligible(cfg, path)
+    }
 }
 fn scan(root: PathBuf, cfg: &Config, tx: &mpsc::SyncSender<Event>, broker: &Broker) {
     let mut stack = vec![root.clone()];
@@ -325,13 +380,16 @@ pub fn track_source(path: PathBuf) {
 pub fn start(broker: Arc<Broker>) {
     thread::spawn(move || {
         background();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(broker)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(broker.clone())));
         let error = match result {
             Ok(Ok(())) => None,
             Ok(Err(e)) => Some(format!("Preflight stopped: {e:#}")),
             Err(_) => Some("Preflight stopped after a panic".to_string()),
         };
         if let Some(error) = error {
+            if crate::runtime::enabled() {
+                crate::runtime::fail(broker);
+            }
             use std::io::Write;
             if let Ok(mut f) = fs::OpenOptions::new()
                 .create(true)
@@ -347,11 +405,15 @@ fn cleanup_only(cfg: &Config) -> anyhow::Result<()> {
     let (tx, rx) = mpsc::sync_channel(4096);
     let _ = NOTIFY.set(tx.clone());
     let roots = cfg.roots_available();
-    for root in &roots {
+    for root in roots.iter().filter(|_| !crate::runtime::enabled()) {
         watch(root.clone(), tx.clone(), cfg.clone(), true);
     }
     let mut watched = HashSet::new();
     let mut track = |source: PathBuf| {
+        if crate::runtime::enabled() {
+            let _ = common::host::track_source(&source);
+            return;
+        }
         if roots.iter().any(|root| common::below(&source, root)) {
             return;
         }
@@ -364,6 +426,8 @@ fn cleanup_only(cfg: &Config) -> anyhow::Result<()> {
     for path in crate::cache_index::sources().unwrap_or_default() {
         track(path);
     }
+    READY.store(true, std::sync::atomic::Ordering::Release);
+    crate::runtime::changed();
     while let Ok(event) = rx.recv() {
         match event {
             Event::Deleted(path) => {
@@ -372,6 +436,9 @@ fn cleanup_only(cfg: &Config) -> anyhow::Result<()> {
                 }
             }
             Event::Track(path) => track(path),
+            Event::Barrier(ack) => {
+                let _ = ack.send(());
+            }
             Event::Shutdown(ack) => {
                 let _ = ack.send(());
                 break;
@@ -383,7 +450,12 @@ fn cleanup_only(cfg: &Config) -> anyhow::Result<()> {
 }
 fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
     let cfg = Config::load()?;
-    crate::cache_index::reconcile();
+    if !crate::runtime::enabled() || crate::runtime::cold() {
+        crate::cache_index::reconcile();
+        if crate::runtime::enabled() {
+            crate::cache_index::refresh_host_hints()?;
+        }
+    }
     if cfg.extensions.is_empty() {
         return cleanup_only(&cfg);
     }
@@ -410,11 +482,11 @@ fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
             s.failed_files
                 .iter()
                 .map(PathBuf::from)
-                .filter(|p| eligible(&cfg, p)),
+                .filter(|p| checkpoint_path_valid(&cfg, p)),
         );
         for p in s.known_files.iter().chain(s.files.iter()) {
             let p = PathBuf::from(p);
-            if eligible(&cfg, &p) {
+            if checkpoint_path_valid(&cfg, &p) {
                 known.insert(p);
             }
         }
@@ -428,7 +500,7 @@ fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
         }
         for p in &s.files {
             let p = PathBuf::from(p);
-            if eligible(&cfg, &p) {
+            if checkpoint_path_valid(&cfg, &p) {
                 files.insert(p, (Instant::now(), 0));
             }
         }
@@ -439,19 +511,22 @@ fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
             }
         }
     }
-    // Attach links to already cached images using metadata, without importing
-    // a model or requesting a scan. The DLL's cache-hit path stays unchanged.
-    for source in known.iter().cloned().chain(
-        saved
-            .iter()
-            .flat_map(|s| s.known_files.iter().map(PathBuf::from))
-            .filter(|p| !known.contains(p)),
-    ) {
-        if let Some(image) = common::cache::find(&source, &cfg) {
-            if let Err(e) = crate::cache_index::remember(&source, &image, &cfg) {
-                crate::cache_index::log(&e);
+    if crate::cache_index::needs_link_backfill() {
+        // Attach links to already cached images using metadata, without importing
+        // a model or requesting a scan. The DLL's cache-hit path stays unchanged.
+        for source in known.iter().cloned().chain(
+            saved
+                .iter()
+                .flat_map(|s| s.known_files.iter().map(PathBuf::from))
+                .filter(|p| !known.contains(p)),
+        ) {
+            if let Some(image) = common::cache::find(&source, &cfg) {
+                if let Err(e) = crate::cache_index::remember(&source, &image, &cfg) {
+                    crate::cache_index::log(&e);
+                }
             }
         }
+        let _ = crate::cache_index::finish_link_backfill();
     }
     let (tx, rx) = mpsc::sync_channel(4096);
     let _ = NOTIFY.set(tx.clone());
@@ -499,11 +574,15 @@ fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
         });
     }
     let watched = cfg.roots_available();
-    for root in &watched {
+    for root in watched.iter().filter(|_| !crate::runtime::enabled()) {
         watch(root.clone(), tx.clone(), cfg.clone(), true);
     }
     let mut auxiliary = HashSet::new();
-    for source in crate::cache_index::sources().unwrap_or_default() {
+    for source in if crate::runtime::enabled() {
+        Vec::new()
+    } else {
+        crate::cache_index::sources().unwrap_or_default()
+    } {
         if !watched.iter().any(|r| common::below(&source, r)) {
             if let Some(parent) = source.parent() {
                 if auxiliary.insert(parent.to_owned()) {
@@ -523,7 +602,9 @@ fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
         .into_iter()
         .filter(|r| volume(r).is_empty())
     {
-        dirs.insert(root);
+        if !crate::runtime::enabled() || crate::runtime::cold() {
+            dirs.insert(root);
+        }
     }
     let mut journals = HashMap::new();
     for v in volumes {
@@ -535,7 +616,11 @@ fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
                         .find(|(key, _)| key.eq_ignore_ascii_case(&v))
                         .map(|(_, c)| *c)
                 });
-                if let Some(old) = old {
+                if let Some(old) =
+                    old.filter(|_| crate::runtime::enabled() && !crate::runtime::cold())
+                {
+                    cursors.insert(v.clone(), old);
+                } else if let Some(old) = old {
                     broker
                         .state
                         .journal_passes
@@ -581,7 +666,9 @@ fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
                     .into_iter()
                     .filter(|r| volume(r).eq_ignore_ascii_case(&v))
                 {
-                    dirs.insert(root);
+                    if !crate::runtime::enabled() || crate::runtime::cold() {
+                        dirs.insert(root);
+                    }
                 }
             }
         }
@@ -686,6 +773,8 @@ fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
                 break;
             }
         }
+        READY.store(true, std::sync::atomic::Ordering::Release);
+        crate::runtime::changed();
         let mut wake = None;
         let mut consider = |t: Instant| wake = Some(wake.map_or(t, |x: Instant| x.min(t)));
         if dirty {
@@ -809,6 +898,12 @@ fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
                         dirty = true;
                     }
                 }
+                Event::Barrier(ack) => {
+                    if save(&cfg, &cursors, &files, &dirs, &known, &failed).is_ok() {
+                        dirty = false;
+                        let _ = ack.send(());
+                    }
+                }
                 Event::Wake => {}
                 Event::Rescan => {
                     dirs.extend(cfg.roots_available());
@@ -825,9 +920,15 @@ fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
                     dirty = true;
                 }
                 Event::Track(source) => {
+                    if crate::runtime::enabled() {
+                        if let Err(e) = common::host::track_source(&source) {
+                            crate::cache_index::log(&e);
+                        }
+                        continue;
+                    }
                     if !watched.iter().any(|r| common::below(&source, r)) {
                         if let Some(parent) = source.parent() {
-                            if auxiliary.insert(parent.to_owned()) {
+                            if !crate::runtime::enabled() && auxiliary.insert(parent.to_owned()) {
                                 watch(parent.to_owned(), tx.clone(), cfg.clone(), false);
                             }
                         }

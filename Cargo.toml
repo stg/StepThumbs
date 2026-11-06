@@ -1,6 +1,6 @@
 [workspace]
-members = ["rust/common", "rust/shell", "rust/app", "rust/xtask"]
-default-members = ["rust/common", "rust/shell", "rust/app"]
+members = ["rust/common", "rust/shell", "rust/app", "rust/host", "rust/xtask"]
+default-members = ["rust/common", "rust/shell", "rust/app", "rust/host"]
 exclude = ["third_party/look"]
 resolver = "2"
 
@@ -33,3 +33,6 @@ lto = "thin"
 codegen-units = 1
 strip = "symbols"
 panic = "unwind"
+
+[profile.release.package.stepthumbnail-host]
+opt-level = "z"

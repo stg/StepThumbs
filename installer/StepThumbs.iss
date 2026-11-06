@@ -32,6 +32,7 @@ SetupIconFile=..\rust\app\assets\app.ico
 Name: "autostart"; Description: "Start StepThumbs when I sign in"; Flags: checkedonce
 [Files]
 Source: "{#BinaryDir}\StepThumbs.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#BinaryDir}\StepThumbsEngine.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BinaryDir}\StepThumbsShell.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#LicenseDir}\*"; DestDir: "{app}\licenses"; Flags: ignoreversion recursesubdirs createallsubdirs

@@ -7,9 +7,10 @@ an upgrade.
 
 ![STEP thumbnails](assets/thumbnails.png)
 
-- **Very low resource usage.** Zero CPU/GPU work and about 29 MB RAM while
-  idling, with GPU resources released after jobs. Preflighting wakes on filesystem
-  changes, with no Windows service or periodic rescans.
+- **Very low resource usage.** Zero CPU/GPU work between events and about 9 MB
+  RAM idle in the tray, with rendering and settings unloaded after a minute
+  without work. Filesystem changes wake preflighting; no Windows service or
+  periodic rescans.
 - **Designed to stay out of your way.** Low CPU and RAM use, low-priority
   preflighting and a tray icon matching Windows' standard icons keep its impact
   on your system small.
@@ -20,7 +21,8 @@ an upgrade.
   it watches for changed models and renders them at low priority; an Explorer
   cache miss gets foreground priority.
 - **Windows clearing its cache doesn't mean starting over.** StepThumbs keeps
-  its own disk cache, which Explorer's thumbnail provider checks first.
+  its own disk cache, which Explorer's thumbnail provider reads directly without
+  waking the renderer.
 - **STEP, STP, STL and GLB.** Render with source colours, edges, ambient occlusion
   and transparent or coloured backgrounds; try changes in the live preview
   using the supplied model or your own.

@@ -80,7 +80,7 @@ fn licenses(root: &Path, meta: &Value, destination: &Path) -> Result<usize> {
         .filter(|p| {
             matches!(
                 p["name"].as_str(),
-                Some("stepthumbnail-app" | "stepthumbnail-shell")
+                Some("stepthumbnail-app" | "stepthumbnail-shell" | "stepthumbnail-host")
             )
         })
         .filter_map(|p| p["id"].as_str())
@@ -267,6 +267,8 @@ fn main() -> Result<()> {
             "stepthumbnail-app",
             "-p",
             "stepthumbnail-shell",
+            "-p",
+            "stepthumbnail-host",
         ]))?;
     }
     let meta = metadata(root)?;
@@ -310,7 +312,11 @@ fn main() -> Result<()> {
     }
     let binaries = target.join("release");
     let mut digest = Sha256::new();
-    for file in ["StepThumbs.exe", "StepThumbsShell.dll"] {
+    for file in [
+        "StepThumbs.exe",
+        "StepThumbsEngine.exe",
+        "StepThumbsShell.dll",
+    ] {
         digest.update(
             fs::read(binaries.join(file))
                 .with_context(|| format!("Missing {file}; build release binaries first"))?,

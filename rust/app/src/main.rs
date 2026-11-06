@@ -6,6 +6,7 @@ mod import_worker;
 mod journal;
 mod monitor;
 mod preview;
+mod runtime;
 mod ui;
 use anyhow::{Context, Result, bail};
 use look::{
@@ -75,6 +76,7 @@ struct State {
     scanning: Mutex<Option<PathBuf>>,
     recent: Mutex<std::collections::VecDeque<Activity>>,
 }
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Activity {
     key: String,
     path: PathBuf,
@@ -430,7 +432,10 @@ fn process_metrics() -> (u64, f64) {
     let (memory, cpu) =
         process_metrics_for(unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() });
     let (workers_memory, workers_cpu) = import_worker::metrics();
-    (memory + workers_memory, cpu + workers_cpu)
+    (
+        memory + workers_memory + runtime::host_memory(),
+        cpu + workers_cpu,
+    )
 }
 fn process_metrics_for(h: windows_sys::Win32::Foundation::HANDLE) -> (u64, f64) {
     unsafe {
@@ -460,7 +465,7 @@ impl Broker {
             success: 0.into(),
             failures: 0.into(),
             hits: 0.into(),
-            paused: Mutex::new(false),
+            paused: Mutex::new(runtime::initially_paused()),
             resumed: Condvar::new(),
             drained: Condvar::new(),
             quiescing: false.into(),
@@ -732,6 +737,7 @@ impl Broker {
         self.thumbnail_priority(path, false)
     }
     fn thumbnail_priority(&self, path: PathBuf, background: bool) -> Outcome {
+        runtime::touch();
         let c = Config::load().map_err(|e| format!("{e:#}"))?;
         if let Some(image) = common::cache::find(&path, &c) {
             if let Err(error) = cache_index::remember(&path, &image, &c) {
@@ -750,6 +756,9 @@ impl Broker {
             return Err(message);
         }
         let key = common::cache::identity(&path, &c).map_err(|e| format!("{e:#}"))?;
+        if let Err(error) = cache_index::forget_missing(&key) {
+            cache_index::log(&error);
+        }
         if c.renderer == "look" {
             if let Some(error) = cache_index::failed(&key).map_err(|e| format!("{e:#}"))? {
                 return Err(format!("Skipped: {} ({error})", path.display()));
@@ -871,42 +880,86 @@ impl Broker {
             .as_ref()
             .map(|p| p.to_string_lossy().to_string());
         let limit = self.cache_limit_mb;
-        serde_json::json!({"queued":self.state.jobs.lock().unwrap().len(),"gpu":if self.state.gpu_active.load(Ordering::SeqCst){"in use"}else{"released"},"success":self.state.success.load(Ordering::Relaxed),"failures":self.state.failures.load(Ordering::Relaxed),"cache_hits":self.state.hits.load(Ordering::Relaxed)+self.shared_stats.as_ref().map(|v|v.hits()).unwrap_or(0),"cache_inventory_passes":cache_index::inventory_passes(),"cache_ready":usage.is_some(),"cache_files":count,"cache_bytes":bytes,"paused":*self.state.paused.lock().unwrap(),"preflight_pending":self.state.preflight_pending.load(Ordering::Relaxed),"preflight_failed":self.state.preflight_failed.load(Ordering::Relaxed),"import_processes_started":import_worker::started(),"scans_started":self.state.scans_started.load(Ordering::Relaxed),"journal_passes":self.state.journal_passes.load(Ordering::Relaxed),"source_bytes":self.state.source_bytes.load(Ordering::Relaxed),"promotions":self.state.promotions.load(Ordering::Relaxed),"current":current,"current_files":current_files,"scanning":scanning,"memory_bytes":memory,"cpu_seconds":cpu,"cache_limit_mb":limit,"recent":self.state.recent.lock().unwrap().iter().map(|entry|entry.text.clone()).collect::<Vec<_>>()})
+        let mut status = serde_json::json!({
+            "queued":self.state.jobs.lock().unwrap().len(),
+            "gpu":if self.state.gpu_active.load(Ordering::SeqCst){"in use"}else{"released"},
+            "success":self.state.success.load(Ordering::Relaxed),
+            "failures":self.state.failures.load(Ordering::Relaxed),
+            "cache_hits":self.state.hits.load(Ordering::Relaxed)+self.shared_stats.as_ref().map(|v|v.hits()).unwrap_or(0),
+            "dll_cache_hits":self.shared_stats.as_ref().map(|v|v.hits()).unwrap_or(0),
+            "cache_inventory_passes":cache_index::inventory_passes(),
+            "cache_ready":usage.is_some(),
+            "cache_files":count,
+            "cache_bytes":bytes,
+            "paused":*self.state.paused.lock().unwrap(),
+            "preflight_pending":self.state.preflight_pending.load(Ordering::Relaxed),
+            "preflight_failed":self.state.preflight_failed.load(Ordering::Relaxed),
+            "import_processes_started":import_worker::started(),
+            "scans_started":self.state.scans_started.load(Ordering::Relaxed),
+            "journal_passes":self.state.journal_passes.load(Ordering::Relaxed),
+            "source_bytes":self.state.source_bytes.load(Ordering::Relaxed),
+            "promotions":self.state.promotions.load(Ordering::Relaxed),
+            "current":current,
+            "current_files":current_files,
+            "scanning":scanning,
+            "memory_bytes":memory,
+            "cpu_seconds":cpu,
+            "cache_limit_mb":limit,
+            "recent":self.state.recent.lock().unwrap().iter().map(|entry|entry.text.clone()).collect::<Vec<_>>()});
+        if runtime::enabled() {
+            status["engine"] = "running".into();
+            status["host_pid"] = runtime::owner().into();
+            status["engine_pid"] = std::process::id().into();
+            status["host_memory_bytes"] = runtime::host_memory().into();
+        }
+        status
     }
 }
 fn serve(broker: Arc<Broker>) -> Result<()> {
     loop {
-        let mut pipe = common::ipc::accept()?;
+        let mut pipe = common::ipc::accept_engine()?;
         let b = broker.clone();
         thread::spawn(move || {
             let mut quitting = false;
-            let response = match common::ipc::read(&mut pipe) {
-                Ok(Request::Thumbnail { path }) => match b.thumbnail(path.into()) {
-                    Ok(path) => Response::image(&path),
-                    Err(e) => Response::error(e),
-                },
-                Ok(Request::Status) => Response::status(b.status()),
-                Ok(Request::Pause { paused }) => {
-                    let mut p = b.state.paused.lock().unwrap();
-                    *p = paused;
-                    if !paused {
-                        b.state.resumed.notify_all();
+            let request = common::ipc::read(&mut pipe);
+            if runtime::enabled()
+                && matches!(&request, Ok(Request::Thumbnail { .. } | Request::Show))
+            {
+                runtime::touch();
+            }
+            let response = if runtime::stopping()
+                || b.state.quiescing.load(std::sync::atomic::Ordering::Acquire)
+            {
+                Response::error("Engine is restarting")
+            } else {
+                match request {
+                    Ok(Request::Thumbnail { path }) => match b.thumbnail(path.into()) {
+                        Ok(path) => Response::image(&path),
+                        Err(e) => Response::error(e),
+                    },
+                    Ok(Request::Status) => Response::status(b.status()),
+                    Ok(Request::Pause { paused }) => {
+                        let mut p = b.state.paused.lock().unwrap();
+                        *p = paused;
+                        if !paused {
+                            b.state.resumed.notify_all();
+                        }
+                        drop(p);
+                        monitor::wake();
+                        ui::update();
+                        Response::ok()
                     }
-                    drop(p);
-                    monitor::wake();
-                    ui::update();
-                    Response::ok()
+                    Ok(Request::Shutdown) => {
+                        b.drain();
+                        quitting = true;
+                        Response::ok()
+                    }
+                    Ok(Request::Show) => {
+                        ui::show_page(0);
+                        Response::ok()
+                    }
+                    Err(e) => Response::error(e),
                 }
-                Ok(Request::Shutdown) => {
-                    b.drain();
-                    quitting = true;
-                    Response::ok()
-                }
-                Ok(Request::Show) => {
-                    ui::show();
-                    Response::ok()
-                }
-                Err(e) => Response::error(e),
             };
             let _ = common::ipc::write(&mut pipe, &response);
             if quitting {
@@ -917,6 +970,12 @@ fn serve(broker: Arc<Broker>) -> Result<()> {
 }
 fn main() -> Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
+    if args.get(1).map(String::as_str) == Some("--engine") {
+        runtime::init(
+            args.get(2).and_then(|v| v.parse().ok()).unwrap_or(0),
+            args.get(3).is_none_or(|v| v != "0"),
+        );
+    }
     if args.get(1).map(String::as_str) == Some("--import-worker") {
         return import_worker::run(args.get(2).and_then(|v| v.parse().ok()).unwrap_or(1));
     }
@@ -1056,14 +1115,20 @@ fn main() -> Result<()> {
     fs::create_dir_all(common::data_dir())?;
     Config::load()?;
     let broker = Broker::new();
+    if runtime::enabled() {
+        runtime::restore(&broker);
+    }
     monitor::start(broker.clone());
     let serving = broker.clone();
     thread::spawn(move || {
         let _ = serve(serving);
     });
-    ui::run(
-        broker,
-        args.get(1).map(String::as_str) != Some("--background"),
+    let result = ui::run(
+        broker.clone(),
+        !matches!(
+            args.get(1).map(String::as_str),
+            Some("--background" | "--engine")
+        ),
         if args.get(1).map(String::as_str) == Some("--file-types") {
             2
         } else if args.get(1).map(String::as_str) == Some("--wait-for") {
@@ -1071,5 +1136,10 @@ fn main() -> Result<()> {
         } else {
             0
         },
-    )
+    );
+    runtime::persist(&broker);
+    if runtime::failed() {
+        bail!("Engine stopped after an IPC or filesystem error");
+    }
+    result
 }
