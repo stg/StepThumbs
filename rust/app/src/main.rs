@@ -915,13 +915,40 @@ impl Broker {
         status
     }
 }
+struct EngineClient {
+    pipe: Option<std::fs::File>,
+    slots: Arc<(Mutex<usize>, Condvar)>,
+}
+impl Drop for EngineClient {
+    fn drop(&mut self) {
+        drop(self.pipe.take());
+        let (count, available) = &*self.slots;
+        *count.lock().unwrap() -= 1;
+        available.notify_one();
+    }
+}
 fn serve(broker: Arc<Broker>) -> Result<()> {
+    let slots = Arc::new((Mutex::new(0usize), Condvar::new()));
     loop {
-        let mut pipe = common::ipc::accept_engine()?;
+        // Keep one of the 32 pipe instances in reserve. Waiting here sleeps
+        // only this acceptor, while existing requests continue independently.
+        let (count, available) = &*slots;
+        let mut count = count.lock().unwrap();
+        while *count >= 31 {
+            count = available.wait(count).unwrap();
+        }
+        *count += 1;
+        drop(count);
+        let mut client = EngineClient {
+            pipe: None,
+            slots: slots.clone(),
+        };
+        client.pipe = Some(common::ipc::accept_engine()?);
         let b = broker.clone();
         thread::spawn(move || {
+            let pipe = client.pipe.as_mut().unwrap();
             let mut quitting = false;
-            let request = common::ipc::read(&mut pipe);
+            let request = common::ipc::read(pipe);
             if runtime::enabled()
                 && matches!(&request, Ok(Request::Thumbnail { .. } | Request::Show))
             {
@@ -961,7 +988,8 @@ fn serve(broker: Arc<Broker>) -> Result<()> {
                     Err(e) => Response::error(e),
                 }
             };
-            let _ = common::ipc::write(&mut pipe, &response);
+            let _ = common::ipc::write(pipe, &response);
+            drop(client);
             if quitting {
                 ui::quit();
             }

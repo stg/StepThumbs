@@ -3,6 +3,7 @@ pub mod config;
 pub mod hooks;
 pub mod host;
 pub mod ipc;
+mod pipe_io;
 pub use config::Config;
 /// Keep diagnostics readable and bounded even when a parser formats its input.
 pub fn brief_error(value: &impl std::fmt::Display) -> String {

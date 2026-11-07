@@ -1,9 +1,7 @@
 //! Small control protocol shared by the resident tray and the disposable engine.
 use anyhow::{Result, bail};
 use std::{
-    fs::File,
-    io::{Read, Write},
-    os::windows::{io::FromRawHandle, process::CommandExt},
+    os::windows::process::CommandExt,
     path::Path,
     time::{Duration, Instant},
 };
@@ -91,49 +89,60 @@ pub fn track_source(path: &Path) -> Result<()> {
     Ok(())
 }
 pub fn request(op: u32, arg: u64) -> Result<([u64; 32], Vec<u8>)> {
-    let until = Instant::now() + Duration::from_secs(4);
+    request_until(op, arg, Instant::now() + Duration::from_secs(4))
+}
+pub(crate) fn request_until(op: u32, arg: u64, until: Instant) -> Result<([u64; 32], Vec<u8>)> {
     let name = crate::wide(pipe_name());
-    let handle = loop {
-        let h = unsafe {
-            CreateFileW(
-                name.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
-                0,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                0,
-                std::ptr::null_mut(),
+    let mut pipe = loop {
+        if Instant::now() >= until {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Tray IPC deadline expired",
             )
-        };
-        if h != INVALID_HANDLE_VALUE {
-            break h;
+            .into());
         }
-        let error = unsafe { GetLastError() };
-        if error != ERROR_PIPE_BUSY || Instant::now() >= until {
-            return Err(std::io::Error::from_raw_os_error(error as i32).into());
+        let error = match crate::pipe_io::Pipe::open(&name) {
+            Ok(pipe) => break pipe,
+            Err(error) => error,
+        };
+        let code = error.raw_os_error().unwrap_or_default() as u32;
+        if code != ERROR_PIPE_BUSY || Instant::now() >= until {
+            return Err(error.into());
         }
         unsafe {
-            WaitNamedPipeW(name.as_ptr(), 100);
+            WaitNamedPipeW(
+                name.as_ptr(),
+                until
+                    .saturating_duration_since(Instant::now())
+                    .as_millis()
+                    .clamp(1, 100) as u32,
+            );
         }
     };
-    let mut pipe = unsafe { File::from_raw_handle(handle) };
-    pipe.write_all(&(MAGIC as u32).to_le_bytes())?;
-    pipe.write_all(&op.to_le_bytes())?;
-    pipe.write_all(&arg.to_le_bytes())?;
+    pipe.write_all(&(MAGIC as u32).to_le_bytes(), until)?;
+    pipe.write_all(&op.to_le_bytes(), until)?;
+    pipe.write_all(&arg.to_le_bytes(), until)?;
     let mut raw = [0u8; 256];
-    pipe.read_exact(&mut raw)?;
+    pipe.read_exact(&mut raw, until)?;
     let header =
         std::array::from_fn(|i| u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap()));
     if header[0] != MAGIC || header[1] != 1 || header[26] > 65536 {
         bail!("Invalid tray response");
     }
     let mut payload = vec![0; header[26] as usize];
-    pipe.read_exact(&mut payload)?;
+    pipe.read_exact(&mut payload, until)?;
     Ok((header, payload))
 }
 pub fn ensure(op: u32, exe: Option<&Path>) -> Result<()> {
-    if request(op, 0).is_ok() {
+    ensure_until(op, exe, Instant::now() + Duration::from_secs(8))
+}
+pub(crate) fn ensure_until(op: u32, exe: Option<&Path>, until: Instant) -> Result<()> {
+    let until = until.min(Instant::now() + Duration::from_secs(8));
+    if request_until(op, 0, until.min(Instant::now() + Duration::from_secs(4))).is_ok() {
         return Ok(());
+    }
+    if Instant::now() >= until {
+        bail!("StepThumbs tray did not respond before the IPC deadline");
     }
     let Some(exe) = exe else {
         bail!("StepThumbs tray is not running");
@@ -142,19 +151,28 @@ pub fn ensure(op: u32, exe: Option<&Path>) -> Result<()> {
         .arg("--wake")
         .creation_flags(0x08000000)
         .spawn()?;
-    let until = Instant::now() + Duration::from_secs(8);
     loop {
-        if request(op, 0).is_ok() {
+        if request_until(op, 0, until.min(Instant::now() + Duration::from_secs(4))).is_ok() {
             return Ok(());
         }
         if Instant::now() >= until {
             bail!("StepThumbs tray did not start");
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(
+            Duration::from_millis(20).min(until.saturating_duration_since(Instant::now())),
+        );
     }
 }
 pub fn idle_status() -> Option<serde_json::Value> {
-    let (header, _) = request(STATUS, 0).ok()?;
+    idle_status_until(Instant::now() + Duration::from_secs(4))
+}
+pub(crate) fn idle_status_until(until: Instant) -> Option<serde_json::Value> {
+    let (header, _) = request_until(
+        STATUS,
+        0,
+        until.min(Instant::now() + Duration::from_secs(4)),
+    )
+    .ok()?;
     let mut value = std::fs::read(crate::data_dir().join("idle-status.json"))
         .ok()
         .and_then(|v| serde_json::from_slice::<serde_json::Value>(&v).ok())

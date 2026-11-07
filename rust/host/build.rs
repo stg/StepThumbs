@@ -54,7 +54,7 @@ fn main() {
             fs::write(out.join(format!("{theme}-{side}.dib")), dib).unwrap();
         }
     }
-    println!("cargo:rustc-link-arg=/SUBSYSTEM:WINDOWS");
+    println!("cargo:rustc-link-arg-bin=StepThumbs=/SUBSYSTEM:WINDOWS");
     println!("cargo:rustc-link-arg=/STACK:262144,4096");
     println!("cargo:rustc-link-arg=/DYNAMICBASE");
     println!("cargo:rustc-link-arg=/NXCOMPAT");

@@ -35,7 +35,7 @@ enum Event {
     Scanned(PathBuf),
     Finished(PathBuf, bool, bool),
     Journal(String),
-    Overflow(String),
+    Overflow(PathBuf),
     Barrier(mpsc::SyncSender<()>),
     Wake,
     Track(PathBuf),
@@ -81,7 +81,7 @@ pub fn ingest(payload: &[u8], overflow: u64) -> anyhow::Result<()> {
         for (i, root) in common::host::watch_roots(&cfg).into_iter().enumerate() {
             if overflow & (1 << i) != 0 {
                 let _ = crate::cache_index::remove_deleted(&root);
-                tx.send(Event::Overflow(volume(&root)))?;
+                tx.send(Event::Overflow(root))?;
             }
         }
     }
@@ -215,7 +215,7 @@ fn watch(root: PathBuf, tx: mpsc::SyncSender<Event>, cfg: Config, recursive: boo
                 let error = if ok == 0 { GetLastError() } else { 0 };
                 let volume = volume(&root);
                 if ok == 0 || returned == 0 {
-                    let _ = tx.send(Event::Overflow(volume));
+                    let _ = tx.send(Event::Overflow(root.clone()));
                     if ok == 0 && error != ERROR_NOTIFY_ENUM_DIR {
                         if let Err(e) = crate::cache_index::remove_deleted(&root) {
                             crate::cache_index::log(&e);
@@ -247,7 +247,7 @@ fn watch(root: PathBuf, tx: mpsc::SyncSender<Event>, cfg: Config, recursive: boo
                     let len = u32::from_le_bytes(bytes[offset + 8..offset + 12].try_into().unwrap())
                         as usize;
                     if len % 2 != 0 || offset + 12 + len > returned as usize {
-                        let _ = tx.send(Event::Overflow(volume.clone()));
+                        let _ = tx.send(Event::Overflow(root.clone()));
                         break;
                     }
                     let words = bytes[offset + 12..offset + 12 + len]
@@ -884,16 +884,19 @@ fn run(broker: Arc<Broker>) -> anyhow::Result<()> {
                         journals_due.insert(v, Instant::now() + Duration::from_secs(2));
                     }
                 }
-                Event::Overflow(v) => {
+                Event::Overflow(root) => {
+                    let v = volume(&root);
                     if journals.contains_key(&v) {
                         journals_due.insert(v, Instant::now());
                     } else {
-                        for r in cfg
-                            .roots_available()
-                            .into_iter()
-                            .filter(|r| volume(r).eq_ignore_ascii_case(&v))
-                        {
-                            dirs.insert(r);
+                        if cfg.included(&root) {
+                            dirs.insert(root);
+                        } else {
+                            dirs.extend(
+                                cfg.roots_available()
+                                    .into_iter()
+                                    .filter(|r| common::below(r, &root)),
+                            );
                         }
                         dirty = true;
                     }

@@ -11,6 +11,7 @@ use core::{
 };
 use stepthumbnail_common as common;
 mod shell_pipe;
+mod watch_open;
 use windows_sys::Win32::{
     Foundation::*,
     Security::*,
@@ -18,7 +19,6 @@ use windows_sys::Win32::{
     System::{
         Diagnostics::Debug::*, IO::*, JobObjects::*, LibraryLoader::*, Memory::*, Performance::*,
         Pipes::*, Registry::*, SystemInformation::*, SystemServices::*, Threading::*,
-        WindowsProgramming::*,
     },
     UI::{
         HiDpi::*,
@@ -81,6 +81,8 @@ struct Watch {
     extended: bool,
     remote: bool,
     pending: bool,
+    retry_at: u64,
+    retry_failures: usize,
 }
 impl Watch {
     const EMPTY: Self = Self {
@@ -92,6 +94,8 @@ impl Watch {
         extended: true,
         remote: false,
         pending: false,
+        retry_at: 0,
+        retry_failures: 0,
     };
 }
 struct Host {
@@ -159,6 +163,8 @@ struct Host {
     wakeups: u64,
     ack: u64,
     watch_errors: u64,
+    watch_epoch: u64,
+    watch_open: Option<watch_open::Attempt>,
 }
 static mut HOST: Host = Host {
     config: None,
@@ -225,6 +231,8 @@ static mut HOST: Host = Host {
     wakeups: 0,
     ack: 0,
     watch_errors: 0,
+    watch_epoch: 0,
+    watch_open: None,
 };
 unsafe fn state() -> &'static mut Host {
     &mut *addr_of_mut!(HOST)
@@ -902,40 +910,83 @@ unsafe fn stop_watch(w: &mut Watch) {
 }
 unsafe fn setup_watches(s: &mut Host) {
     for i in 0..s.roots {
-        let path = text(s, s.watch[i].path);
-        let file = CreateFileW(
-            path,
-            FILE_LIST_DIRECTORY,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            null(),
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
-            null_mut(),
-        );
-        if file == INVALID_HANDLE_VALUE {
-            s.watch_errors += 1;
-            continue;
-        }
-        let event = CreateEventW(null(), 1, 0, null());
-        let buffer: *mut u8 = VirtualAlloc(
-            null(),
-            WATCH_BYTES,
-            MEM_COMMIT | MEM_RESERVE,
-            PAGE_READWRITE,
-        )
-        .cast();
-        if event.is_null() || buffer.is_null() {
-            fatal(6);
-        }
-        s.watch[i].file = file;
-        s.watch[i].event = event;
-        s.watch[i].buffer = buffer;
-        s.watch[i].remote = GetDriveTypeW(path) == DRIVE_REMOTE;
-        if !arm(&mut s.watch[i]) {
-            s.watch_errors += 1;
-            stop_watch(&mut s.watch[i]);
-        }
+        s.watch[i].retry_at = GetTickCount64().max(1);
+        s.watch[i].retry_failures = 0;
     }
+}
+unsafe fn failed_watch(s: &mut Host, index: usize) {
+    s.watch_errors += 1;
+    let watch = &mut s.watch[index];
+    stop_watch(watch);
+    let delay = [1000, 2000, 5000, 15000, 30000][watch.retry_failures.min(4)];
+    watch.retry_failures = watch.retry_failures.saturating_add(1);
+    watch.retry_at = GetTickCount64().saturating_add(delay);
+}
+fn next_watch_retry(s: &Host) -> Option<u64> {
+    if s.quitting || s.watch_open.is_some() {
+        return None;
+    }
+    s.watch[..s.roots]
+        .iter()
+        .filter_map(|w| (w.retry_at != 0).then_some(w.retry_at))
+        .min()
+}
+unsafe fn begin_watch_retry(s: &mut Host) {
+    let now = GetTickCount64();
+    let Some(at) = next_watch_retry(s).filter(|at| *at <= now) else {
+        return;
+    };
+    let index = s.watch[..s.roots]
+        .iter()
+        .position(|w| w.retry_at == at)
+        .unwrap();
+    let root = s.watch[index].path;
+    let path = core::slice::from_raw_parts(text(s, root), root.len + 1).to_vec();
+    match watch_open::Attempt::start(path, index, s.watch_epoch) {
+        Ok(attempt) => s.watch_open = Some(attempt),
+        Err(_) => failed_watch(s, index),
+    }
+}
+unsafe fn finish_watch_retry(s: &mut Host) -> bool {
+    let Some(attempt) = s.watch_open.take() else {
+        return false;
+    };
+    let (epoch, index) = (attempt.epoch, attempt.root);
+    let opened = attempt.finish();
+    if epoch != s.watch_epoch || index >= s.roots {
+        return false;
+    }
+    let Ok(opened) = opened else {
+        failed_watch(s, index);
+        return false;
+    };
+    use std::os::windows::io::IntoRawHandle;
+    let watch = &mut s.watch[index];
+    watch.file = opened.file.into_raw_handle();
+    watch.remote = opened.remote;
+    watch.extended = true;
+    watch.event = CreateEventW(null(), 1, 0, null());
+    watch.buffer = VirtualAlloc(
+        null(),
+        WATCH_BYTES,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE,
+    )
+    .cast();
+    if watch.event.is_null() || watch.buffer.is_null() {
+        fatal(6);
+    }
+    if !arm(watch) {
+        failed_watch(s, index);
+        return false;
+    }
+    watch.retry_at = 0;
+    watch.retry_failures = 0;
+    // A journal catch-up or affected-root scan covers the disconnected interval.
+    s.dirty |= 1 << index;
+    s.generation = s.generation.wrapping_add(1);
+    s.cleanup_demand = true;
+    true
 }
 unsafe fn queue_page(s: &mut Host, page: u64) {
     if s.quitting {
@@ -969,6 +1020,7 @@ unsafe fn reload_config(s: &mut Host) {
         });
     s.config = Some(config);
     if roots_changed {
+        s.watch_epoch = s.watch_epoch.wrapping_add(1);
         for watch in &mut s.watch[..s.roots] {
             stop_watch(watch);
         }
@@ -1063,8 +1115,7 @@ unsafe fn watch_event(s: &mut Host, index: usize) -> bool {
         s.dirty |= 1 << index;
         s.generation = s.generation.wrapping_add(1);
         if !arm(w) {
-            s.watch_errors += 1;
-            stop_watch(w);
+            failed_watch(s, index);
         }
         return true;
     }
@@ -1210,8 +1261,7 @@ unsafe fn watch_event(s: &mut Host, index: usize) -> bool {
         at += next;
     }
     if !arm(&mut s.watch[index]) {
-        s.watch_errors += 1;
-        stop_watch(&mut s.watch[index]);
+        failed_watch(s, index);
     }
     work
 }
@@ -1517,14 +1567,30 @@ unsafe fn main_host() -> u32 {
                 );
             }
         }
-        let mut handles = [null_mut(); MAX_ROOTS + 5];
-        let mut kinds = [0u32; MAX_ROOTS + 5];
+        // Enforce deadlines even if a busy volume keeps a wait handle signalled.
+        if shell.expire().is_err() {
+            fatal(4);
+        }
+        if s.deadline != 0 && GetTickCount64() >= s.deadline {
+            disconnect(s);
+        }
+        begin_watch_retry(s);
+        let mut handles = [null_mut(); MAX_ROOTS + 6];
+        let mut kinds = [0u32; MAX_ROOTS + 6];
         let mut n = 0;
         handles[n] = s.pipe_event;
         n += 1;
         handles[n] = shell.event;
         kinds[n] = 200;
         n += 1;
+        handles[n] = shell.capacity_event();
+        kinds[n] = 201;
+        n += 1;
+        if let Some(attempt) = &s.watch_open {
+            handles[n] = attempt.event();
+            kinds[n] = 202;
+            n += 1;
+        }
         for i in 0..s.roots {
             if s.watch[i].file != INVALID_HANDLE_VALUE {
                 handles[n] = s.watch[i].event;
@@ -1555,6 +1621,10 @@ unsafe fn main_host() -> u32 {
         }
         if s.worker.is_null() && s.restart_at != 0 && !s.quitting {
             timeout = timeout.min(s.restart_at.saturating_sub(GetTickCount64()) as u32);
+        }
+        if let Some(at) = next_watch_retry(s) {
+            timeout =
+                timeout.min(at.saturating_sub(GetTickCount64()).min(u32::MAX as u64 - 1) as u32);
         }
         let result = MsgWaitForMultipleObjectsEx(
             n as u32,
@@ -1593,6 +1663,12 @@ unsafe fn main_host() -> u32 {
                         fatal(4);
                     }
                 }
+                201 => {
+                    if shell.capacity_changed().is_err() {
+                        fatal(4);
+                    }
+                }
+                202 => work = finish_watch_retry(s),
                 101 => {
                     s.ready_us = micros(s, ticks() - s.worker_since);
                     CloseHandle(s.ready);
@@ -1718,5 +1794,68 @@ fn main() {
         let result = main_host();
         CloseHandle(mutex);
         std::process::exit(result as i32);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn failed_watch_recovers_and_removes_its_retry_timer() {
+        let folder = std::env::temp_dir().join(format!(
+            "StepThumbs-watch-recovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(!folder.exists());
+        unsafe {
+            // This executable has one host-state test; no tray or renderer runs.
+            let s = state();
+            let path = common::wide(&folder);
+            s.watch[0].path = copy_text(s, path.as_ptr(), path.len() - 1);
+            s.roots = 1;
+            let config = common::Config {
+                roots: vec![folder.to_string_lossy().into_owned()],
+                exclude: Vec::new(),
+                ..Default::default()
+            };
+            s.config = Some(config);
+            setup_watches(s);
+            begin_watch_retry(s);
+            assert_eq!(
+                WaitForSingleObject(s.watch_open.as_ref().unwrap().event(), 5000),
+                WAIT_OBJECT_0
+            );
+            assert!(!finish_watch_retry(s));
+            assert_eq!(s.watch[0].file, INVALID_HANDLE_VALUE);
+            assert_eq!(s.watch[0].retry_failures, 1);
+            assert!(next_watch_retry(s).unwrap() > GetTickCount64());
+
+            std::fs::create_dir(&folder).unwrap();
+            s.watch[0].retry_at = GetTickCount64().max(1);
+            begin_watch_retry(s);
+            assert_eq!(
+                WaitForSingleObject(s.watch_open.as_ref().unwrap().event(), 5000),
+                WAIT_OBJECT_0
+            );
+            assert!(finish_watch_retry(s));
+            assert_ne!(s.watch[0].file, INVALID_HANDLE_VALUE);
+            assert_eq!(s.watch[0].retry_failures, 0);
+            assert_eq!(next_watch_retry(s), None);
+            assert_eq!(s.dirty, 1); // missed changes require reconciliation
+
+            let model = folder.join("new.step");
+            std::fs::write(&model, b"filesystem notification test").unwrap();
+            assert_eq!(WaitForSingleObject(s.watch[0].event, 5000), WAIT_OBJECT_0);
+            assert!(watch_event(s, 0));
+            assert!(s.queue_count > 0);
+            stop_watch(&mut s.watch[0]);
+            clear_queue(s);
+            std::fs::remove_file(model).unwrap();
+            std::fs::remove_dir(folder).unwrap();
+        }
     }
 }

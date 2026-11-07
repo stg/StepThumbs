@@ -42,6 +42,10 @@ jobs:
           if ($LASTEXITCODE) { throw 'Rust installation failed.' }
           rustup default 1.96.1
           if ($LASTEXITCODE) { throw 'Rust selection failed.' }
+      - name: Check IPC deadlines, request pressure and watch recovery
+        run: |
+          cargo test --workspace --all-targets --locked
+          if ($LASTEXITCODE) { throw 'Regression tests failed.' }
       - name: Build native app and shell provider
         run: |
           cargo build --release --locked

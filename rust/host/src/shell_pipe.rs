@@ -4,7 +4,32 @@ use std::{
     mem::zeroed,
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     ptr::{null, null_mut},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
+
+// Reserve the listening instance and one transient hand-off slot out of 32.
+const MAX_RELAYS: usize = 30;
+struct Relays {
+    active: AtomicUsize,
+    changed: OwnedHandle,
+}
+struct Relay {
+    pipe: Option<OwnedHandle>,
+    state: Arc<Relays>,
+}
+impl Drop for Relay {
+    fn drop(&mut self) {
+        // Release the pipe instance before announcing that its slot is free.
+        drop(self.pipe.take());
+        self.state.active.fetch_sub(1, Ordering::AcqRel);
+        unsafe {
+            SetEvent(self.state.changed.as_raw_handle());
+        }
+    }
+}
 use stepthumbnail_common as common;
 use windows_sys::Win32::{
     Foundation::*,
@@ -22,9 +47,12 @@ pub struct Listener {
     body: Vec<u8>,
     filled: usize,
     pub deadline: u64,
+    relays: Arc<Relays>,
 }
 impl Listener {
     pub unsafe fn new() -> anyhow::Result<Box<Self>> {
+        let changed = unsafe { CreateEventW(null(), 1, 0, null()) };
+        anyhow::ensure!(!changed.is_null(), "Cannot create shell capacity event");
         let mut listener = Box::new(Self {
             pipe: INVALID_HANDLE_VALUE,
             event: unsafe { CreateEventW(null(), 1, 0, null()) },
@@ -35,6 +63,10 @@ impl Listener {
             body: Vec::new(),
             filled: 0,
             deadline: 0,
+            relays: Arc::new(Relays {
+                active: AtomicUsize::new(0),
+                changed: unsafe { OwnedHandle::from_raw_handle(changed) },
+            }),
         });
         anyhow::ensure!(!listener.event.is_null(), "Cannot create shell pipe event");
         unsafe {
@@ -137,7 +169,41 @@ impl Listener {
             if self.filled < self.body.len() {
                 return self.read();
             }
-            let owned = OwnedHandle::from_raw_handle(self.pipe);
+            // Hold this complete request while all relay slots are occupied.
+            // Further callers wait for a pipe instance, within their deadline.
+            self.phase = 3;
+            self.deadline = 0;
+            self.reset_io();
+            self.dispatch()
+        }
+    }
+    pub fn capacity_event(&self) -> HANDLE {
+        self.relays.changed.as_raw_handle()
+    }
+    #[cfg(test)]
+    #[allow(dead_code)] // Only the isolated integration test uses this probe.
+    pub fn waiting_for_capacity(&self) -> bool {
+        self.phase == 3 && self.relays.active.load(Ordering::Acquire) >= MAX_RELAYS
+    }
+    pub unsafe fn capacity_changed(&mut self) -> anyhow::Result<()> {
+        unsafe {
+            ResetEvent(self.capacity_event());
+            if self.phase == 3 {
+                self.dispatch()?;
+            }
+            Ok(())
+        }
+    }
+    unsafe fn dispatch(&mut self) -> anyhow::Result<()> {
+        unsafe {
+            if self.relays.active.load(Ordering::Acquire) >= MAX_RELAYS {
+                return Ok(());
+            }
+            self.relays.active.fetch_add(1, Ordering::AcqRel);
+            let relay = Relay {
+                pipe: Some(OwnedHandle::from_raw_handle(self.pipe)),
+                state: self.relays.clone(),
+            };
             self.pipe = INVALID_HANDLE_VALUE;
             let body = std::mem::take(&mut self.body);
             self.connect()?;
@@ -159,10 +225,11 @@ impl Listener {
                         Err(e) => Ok(common::ipc::Response::error(e)),
                     }
                     .unwrap_or_else(common::ipc::Response::error);
-                    let _ = write(owned.as_raw_handle(), &response);
+                    let _ = write(relay.pipe.as_ref().unwrap().as_raw_handle(), &response);
                     if quitting {
                         let _ = common::host::request(common::host::QUIT, 0);
                     }
+                    drop(relay);
                 })?;
             Ok(())
         }
